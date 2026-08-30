@@ -296,8 +296,10 @@ export class Globe {
           arcHeightScale: 0.35,
           gradation: 0.35,
           dashed: l.dashed,
-          dashSize: Math.max(l.len / 14, 30_000),
-          gapSize: Math.max(l.len / 28, 15_000),
+          // 区間長に比例させる (絶対値の下限を大きくすると短い区間がダッシュ1周期に
+          // 収まってしまい、dashOffset アニメーションで丸ごと明滅する)
+          dashSize: Math.max(l.len / 14, 2_500),
+          gapSize: Math.max(l.len / 28, 1_250),
           dashOffset: this.dashOffset,
         }));
         this.arcs = this.view.addMesh<ArclineMeshDesc>({

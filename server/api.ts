@@ -50,9 +50,12 @@ function isPrivateIp(ip: string): boolean {
   );
 }
 
-// ip-api.com は 45req/分 制限があるので、300ms 窓でまとめて batch API に投げる
+// ip-api.com の /batch は 15req/分 制限 (超過で 429 → 1時間 ban もあり得る)。
+// 300ms 窓でまとめつつ、前回のリクエストから 4.2 秒空くまでは次のバッチを送らない。
+const BATCH_MIN_INTERVAL_MS = 4_200;
 let pendingIps = new Map<string, Array<(g: GeoInfo) => void>>();
 let batchTimer: ReturnType<typeof setTimeout> | null = null;
+let lastBatchAt = 0;
 
 function lookupGeo(ip: string): Promise<GeoInfo> {
   const cached = geoCache.get(ip);
@@ -66,12 +69,16 @@ function lookupGeo(ip: string): Promise<GeoInfo> {
     const list = pendingIps.get(ip) ?? [];
     list.push(resolve);
     pendingIps.set(ip, list);
-    if (!batchTimer) batchTimer = setTimeout(flushGeoBatch, 300);
+    if (!batchTimer) {
+      const wait = Math.max(300, lastBatchAt + BATCH_MIN_INTERVAL_MS - Date.now());
+      batchTimer = setTimeout(flushGeoBatch, wait);
+    }
   });
 }
 
 async function flushGeoBatch() {
   batchTimer = null;
+  lastBatchAt = Date.now();
   const batch = pendingIps;
   pendingIps = new Map();
   const ips = [...batch.keys()];
@@ -234,7 +241,8 @@ function handleTrace(req: IncomingMessage, res: ServerResponse) {
       sseSend(res, { type: "hop", ttl, ip: null, rtt: null });
       return;
     }
-    const pm = rest.match(/^([0-9a-fA-F.:]+)\s+([\d.]+)\s*ms(.*)$/);
+    // IPv6 リンクローカルの %en0 のようなゾーンIDは落として IP として扱う
+    const pm = rest.match(/^([0-9a-fA-F.:]+)(?:%[A-Za-z0-9._-]+)?\s+([\d.]+)\s*ms(.*)$/);
     if (pm) {
       const ip = pm[1];
       sseSend(res, { type: "hop", ttl, ip, rtt: Number(pm[2]), note: pm[3].trim() || undefined });
@@ -270,15 +278,18 @@ function handleTrace(req: IncomingMessage, res: ServerResponse) {
 // ---------------------------------------------------------------------------
 
 async function handleEnrich(req: IncomingMessage, res: ServerResponse) {
-  const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
   let ips: string[] = [];
   try {
+    // 送信中の切断 (aborted) でも reject が漏れて dev サーバごと落ちないように
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
     const body = JSON.parse(Buffer.concat(chunks).toString());
     if (Array.isArray(body.ips)) ips = body.ips.filter((x: unknown) => typeof x === "string");
   } catch {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "invalid body" }));
+    if (!res.headersSent && !res.writableEnded) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid body" }));
+    }
     return;
   }
   ips = [...new Set(ips)].slice(0, 100);

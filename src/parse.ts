@@ -14,6 +14,11 @@ function isIpToken(t: string): boolean {
   return t.includes(":") && V6_RE.test(t);
 }
 
+/** "fe80::1%en0" のようなゾーンIDを外す */
+function stripZone(t: string): string {
+  return t.replace(/%[A-Za-z0-9._-]+$/, "");
+}
+
 /**
  * traceroute / traceroute6 / Windows tracert / mtr --report の
  * 貼り付けテキストをゆるくパースする。
@@ -41,7 +46,8 @@ export function parseTraceText(text: string): ParsedTrace {
     }
 
     // mtr --report:  "  3.|-- 203.0.113.1   0.0%  10  1.2  1.5  1.1  2.0  0.3"
-    m = line.match(/^\s*(\d+)\.\|--\s+(\S+)\s+([\d.]+)%\s+\d+\s+([\d.]+)\s+([\d.]+)/);
+    // (mtr 0.95 は 100% ロス時に桁あふれで % が欠けて "100.0" になるため % は任意)
+    m = line.match(/^\s*(\d+)\.\|--\s+(\S+)\s+([\d.]+)%?\s+\d+\s+([\d.]+)\s+([\d.]+)/);
     if (m) {
       const ttl = Number(m[1]);
       const hostTok = m[2];
@@ -73,14 +79,14 @@ export function parseTraceText(text: string): ParsedTrace {
     // IP を探す: "host (1.2.3.4)" / "host [1.2.3.4]" / 裸の IP トークン
     let ip: string | null = null;
     let hostname: string | undefined;
-    const paren = rest.match(/(\S+)\s+[([]([0-9a-fA-F.:]+)[)\]]/);
-    if (paren && isIpToken(paren[2])) {
-      ip = paren[2];
+    const paren = rest.match(/(\S+)\s+[([]([0-9a-fA-F.:]+(?:%[A-Za-z0-9._-]+)?)[)\]]/);
+    if (paren && isIpToken(stripZone(paren[2]))) {
+      ip = stripZone(paren[2]);
       if (paren[1] !== ip && !/^[\d.]+$/.test(paren[1])) hostname = paren[1];
     } else {
       const tokens = rest.split(/\s+/);
       for (let i = 0; i < tokens.length; i++) {
-        const tok = tokens[i].replace(/^[([]|[)\]]$/g, "");
+        const tok = stripZone(tokens[i].replace(/^[([]|[)\]]$/g, ""));
         if (isIpToken(tok)) {
           ip = tok;
           const prev = tokens[i - 1];

@@ -23,6 +23,8 @@ let handle: TraceHandle | null = null;
 let running = false;
 let follow = true;
 let lastChainLen = 0;
+let traceGen = 0; // 古い非同期処理 (enrich 等) が新しいトレースを上書きしないための世代番号
+let lastInfo: string | null = null; // traceroute の stderr 最終行 (エラー表示用)
 
 const globe = new Globe();
 if (import.meta.env.DEV) {
@@ -171,12 +173,24 @@ function flyToHop(hop: Hop) {
 // ---------------------------------------------------------------------------
 
 function resetTrace(newTarget: string) {
+  traceGen++;
   hops.clear();
   target = newTarget;
   targetIp = undefined;
+  lastInfo = null;
   lastChainLen = 0;
   globe.reset();
   renderList();
+}
+
+/** 実行中のライブトレースを止める (貼り付けモードへの切り替え時など) */
+function stopLive() {
+  if (!running) return;
+  handle?.stop();
+  handle = null;
+  running = false;
+  runButton.textContent = "トレース開始";
+  runButton.classList.remove("danger");
 }
 
 liveForm.addEventListener("submit", (e) => {
@@ -232,12 +246,17 @@ liveForm.addEventListener("submit", (e) => {
           renderList();
           break;
         case "info":
+          lastInfo = ev.line;
           break;
         case "error":
           finishTrace(`エラー: ${ev.message}`);
           break;
         case "done":
-          finishTrace("完了");
+          finishTrace(
+            ev.code === 0 || ev.code == null
+              ? "完了"
+              : `traceroute が失敗しました: ${lastInfo ?? `exit ${ev.code}`}`,
+          );
           break;
       }
     },
@@ -252,6 +271,27 @@ function finishTrace(message: string) {
   setStatus(message);
   updateGlobe(false);
   if (follow && lastChainLen > 1) globe.fitAll();
+  // SSE クローズまでに間に合わなかった / レートリミットで fail になったジオ情報を補完
+  const missing = [...hops.values()]
+    .filter((h) => h.ip && (!h.geo || h.geo.status === "fail"))
+    .map((h) => h.ip as string);
+  if (missing.length === 0) return;
+  const gen = traceGen;
+  void enrichIps(missing)
+    .then((results) => {
+      if (gen !== traceGen) return; // すでに次のトレースが始まっている
+      for (const hop of hops.values()) {
+        if (!hop.ip) continue;
+        const r = results[hop.ip];
+        if (!r) continue;
+        if (!hop.geo || hop.geo.status === "fail") hop.geo = r.geo;
+        hop.hostname = hop.hostname ?? r.hostname ?? undefined;
+      }
+      renderList();
+      updateGlobe(false);
+      if (follow && currentChain().length > 1) globe.fitAll();
+    })
+    .catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -266,14 +306,17 @@ pasteForm.addEventListener("submit", (e) => {
     setStatus("ホップ行を読み取れませんでした");
     return;
   }
+  stopLive(); // 実行中のライブトレースのイベントが混ざらないように
   resetTrace(parsed.target ?? "(貼り付け)");
   targetIp = parsed.targetIp ?? parsed.hops[parsed.hops.length - 1].ip ?? undefined;
   for (const hop of parsed.hops) hops.set(hop.ttl, hop);
   renderList();
   setStatus(`${parsed.hops.length} ホップを読み込み、位置情報を取得中…`);
   const ips = parsed.hops.map((h) => h.ip).filter((ip): ip is string => ip != null);
+  const gen = traceGen;
   void enrichIps(ips)
     .then((results) => {
+      if (gen !== traceGen) return; // すでに次のトレースが始まっている
       for (const hop of hops.values()) {
         if (!hop.ip) continue;
         const r = results[hop.ip];
@@ -286,7 +329,9 @@ pasteForm.addEventListener("submit", (e) => {
       updateGlobe(false);
       globe.fitAll();
     })
-    .catch((err) => setStatus(`位置情報の取得に失敗: ${err.message}`));
+    .catch((err) => {
+      if (gen === traceGen) setStatus(`位置情報の取得に失敗: ${err.message}`);
+    });
 });
 
 // ---------------------------------------------------------------------------
