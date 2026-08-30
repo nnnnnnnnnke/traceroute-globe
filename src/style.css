@@ -1,0 +1,373 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --bg: #04070d;
+  --panel: rgba(10, 18, 30, 0.82);
+  --panel-border: rgba(125, 190, 255, 0.16);
+  --ink: #e6f1fb;
+  --ink-2: #9fb4c8;
+  --ink-3: #5f7186;
+  --accent: #38bdf8;
+  --accent-dim: rgba(56, 189, 248, 0.16);
+  --dest: #ffc247;
+  --danger: #f87171;
+  --mono: "SF Mono", ui-monospace, "Menlo", monospace;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  font-size: 14px;
+}
+
+#globe {
+  position: fixed;
+  inset: 0;
+}
+#globe canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.panel {
+  position: fixed;
+  z-index: 10;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+}
+
+/* ---- 左上: コントロール ---- */
+#control {
+  top: 16px;
+  left: 16px;
+  width: 320px;
+  padding: 16px;
+}
+#control h1 {
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  margin-bottom: 12px;
+}
+#control h1 span {
+  color: var(--accent);
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 9px;
+  padding: 3px;
+  margin-bottom: 12px;
+}
+.tab {
+  flex: 1;
+  border: 0;
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 0;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.tab.active {
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+#host,
+#paste-text {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 9px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 9px 11px;
+  outline: none;
+}
+#host:focus,
+#paste-text:focus {
+  border-color: var(--accent);
+}
+#paste-text {
+  resize: vertical;
+  min-height: 120px;
+  line-height: 1.5;
+}
+
+.opts {
+  display: flex;
+  gap: 8px;
+  margin: 10px 0;
+}
+.seg {
+  flex: 1;
+  display: flex;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  padding: 2px;
+}
+.seg button {
+  flex: 1;
+  border: 0;
+  background: transparent;
+  color: var(--ink-3);
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.seg button.active {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+button.primary {
+  width: 100%;
+  margin-top: 10px;
+  border: 0;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #04121e;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  padding: 10px 0;
+  cursor: pointer;
+  transition: filter 0.15s;
+}
+button.primary:hover {
+  filter: brightness(1.12);
+}
+button.primary.danger {
+  background: var(--danger);
+}
+
+#status {
+  margin-top: 12px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+#status-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ink-3);
+  flex: none;
+}
+.dot-run {
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+.follow {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  color: var(--ink-2);
+  user-select: none;
+}
+.follow input {
+  accent-color: var(--accent);
+}
+#cmd-line {
+  display: block;
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  word-break: break-all;
+}
+
+/* ---- 右: ホップ一覧 ---- */
+#hops {
+  top: 16px;
+  right: 16px;
+  width: 330px;
+  max-height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#hops[hidden] {
+  display: none;
+}
+#hops header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 13px 14px 10px;
+  border-bottom: 1px solid var(--panel-border);
+}
+#hops h2 {
+  flex: 1;
+  font-size: 13.5px;
+  font-weight: 700;
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#fit {
+  border: 1px solid var(--panel-border);
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 12px;
+  border-radius: 7px;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+#fit:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+#hop-list {
+  list-style: none;
+  overflow-y: auto;
+  padding: 6px;
+}
+.hop {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 7px 8px;
+  border-radius: 9px;
+}
+.hop.clickable {
+  cursor: pointer;
+}
+.hop.clickable:hover {
+  background: var(--accent-dim);
+}
+.hop .ttl {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: rgba(56, 189, 248, 0.14);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 700;
+}
+.hop.timeout .ttl,
+.hop.nogeo .ttl {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--ink-3);
+}
+.hop.dest .ttl {
+  background: rgba(255, 194, 71, 0.16);
+  color: var(--dest);
+}
+.hop-main {
+  min-width: 0;
+}
+.hop-ip {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hop.timeout .hop-ip {
+  color: var(--ink-3);
+}
+.hop-host {
+  color: var(--ink-3);
+  font-size: 11px;
+}
+.hop-meta {
+  font-size: 11.5px;
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- 地図上のチップ ---- */
+#chip-root {
+  position: fixed;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  overflow: hidden;
+}
+.chip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: left top;
+  translate: 10px -26px;
+  pointer-events: auto;
+  will-change: transform;
+  border: 1px solid rgba(139, 226, 255, 0.35);
+  background: rgba(8, 20, 34, 0.78);
+  color: #cfeaff;
+  font: 600 11px var(--mono);
+  padding: 3px 8px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.chip:hover {
+  border-color: var(--accent);
+}
+.chip-dest {
+  border-color: rgba(255, 194, 71, 0.6);
+  color: #ffe2a8;
+}
+.chip-origin {
+  border-color: rgba(255, 255, 255, 0.3);
+  color: var(--ink-2);
+}
+
+/* ---- attribution (Navara組込UI) を控えめに ---- */
+@media (max-width: 900px) {
+  #control {
+    width: calc(100vw - 32px);
+  }
+  #hops {
+    top: auto;
+    bottom: 16px;
+    max-height: 40vh;
+    width: calc(100vw - 32px);
+  }
+}

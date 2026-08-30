@@ -1,0 +1,24 @@
+{
+  "name": "traceroute-globe",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@navaramap/three": "^0.1.0",
+    "@navaramap/three-default-descs": "^0.1.0",
+    "@navaramap/three-default-plugin": "^0.1.0",
+    "@navaramap/three-plugins": "^0.1.0",
+    "postprocessing": "^6.38.0",
+    "three": "^0.183.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0"
+  }
+}
