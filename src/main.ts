@@ -848,7 +848,16 @@ $<HTMLButtonElement>("#fit").addEventListener("click", () => globe.fitAll());
 
 async function boot() {
   renderHistory();
+  // 地球儀の初期化 (WASM+タイル) が済むまで実行系ボタンを止める
+  const visualizeButton = $<HTMLButtonElement>("#visualize");
+  runButton.disabled = true;
+  visualizeButton.disabled = true;
+  const runLabel = runButton.textContent;
+  runButton.textContent = "地球儀を初期化中…";
   await globe.init($("#globe"), createChipRoot());
+  runButton.disabled = false;
+  visualizeButton.disabled = false;
+  runButton.textContent = runLabel;
   globe.setNodeClickHandler((node) => void globe.flyToNode(node));
   globe.onUserGrab(() => {
     if (!follow) return;

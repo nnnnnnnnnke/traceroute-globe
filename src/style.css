@@ -160,6 +160,11 @@ button.primary {
 button.primary:hover {
   filter: brightness(1.12);
 }
+button.primary:disabled {
+  opacity: 0.55;
+  cursor: wait;
+  filter: none;
+}
 button.primary.danger {
   background: var(--danger);
 }

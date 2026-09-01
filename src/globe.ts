@@ -228,7 +228,19 @@ export class Globe {
     });
     view.addLayer({ type: "raster", source: basemap });
 
-    view.addMesh<GlowGlobeMeshDesc>({
+    // 近距離用の詳細ダークマップ (OSMベース, maxzoom 22)。Black Marble は
+    // maxzoom 8 (約500m/px) しかないため、高度に応じてこちらへクロスフェード
+    const detailSource = await tilejson.addSource({
+      type: "raster-tile",
+      url: "https://papers.reearth.land/styles/papers-dark/tilejson.json",
+    });
+    const detailLayer = view.addLayer({
+      type: "raster",
+      source: detailSource,
+      raster: { opacity: 0 },
+    });
+
+    const glow = view.addMesh<GlowGlobeMeshDesc>({
       glowGlobe: {
         radiusScale: 1.08,
         coefficient: 0.35,
@@ -238,17 +250,44 @@ export class Globe {
       },
     });
 
-    // メルカトルタイルは ±85.05° まで。極に開いた穴からグロー殻の内側が
-    // 明るい円盤として見えてしまうため、両極を暗い薄型シリンダーで塞ぐ
+    // 高度連動: 下がるほど詳細マップを濃く、大気グローを薄く
+    const DETAIL_FULL = 250_000; // これ以下で詳細マップ100%
+    const DETAIL_START = 1_400_000; // これ以上で Black Marble のみ
+    let lastDetailOp = -1;
+    let lastGlowOp = -1;
+    const applyLod = () => {
+      const h = this.view.camera.positionGeographic.height;
+      const t = Math.min(1, Math.max(0, (DETAIL_START - h) / (DETAIL_START - DETAIL_FULL)));
+      const detailOp = Math.round(t * 20) / 20;
+      if (detailOp !== lastDetailOp) {
+        lastDetailOp = detailOp;
+        detailLayer.update({
+          type: "raster",
+          source: detailSource,
+          raster: { opacity: detailOp },
+        });
+      }
+      const glowOp = Math.round((0.9 - t * 0.75) * 20) / 20;
+      if (glowOp !== lastGlowOp) {
+        lastGlowOp = glowOp;
+        glow.update({ glowGlobe: { opacity: glowOp } });
+      }
+    };
+    view.camera.on("move", applyLod);
+    applyLod();
+
+    // メルカトルタイルは ±85.05° まで。極に開いた穴からグロー殻 (高度約510km)
+    // の内側が見えてしまう。薄い円盤だと斜めからの視線が上を通り抜けるため、
+    // グロー殻の高さまで届く暗い「栓」で塞ぐ
     for (const lat of [90, -90]) {
       view.addMesh<CylinderMeshDesc>({
-        geodetic: { lat, lng: 0, height: -20_000 },
+        geodetic: { lat, lng: 0, height: 250_000 },
         cylinders: {
           radiusTop: 1,
           radiusBottom: 1,
           radialSegments: 48,
           color: new Color().setStyle("#050a12"),
-          children: [{ radius: 650_000, height: 40_000 }],
+          children: [{ radius: 650_000, height: 530_000 }],
         },
       });
     }
@@ -420,7 +459,7 @@ export class Globe {
           this.pulse = this.view.addMesh<ArclineMeshDesc>({
             effectIds: [this.bloomId],
             emissiveColor: new Color().setStyle("#ffffff"),
-            emissiveIntensity: 0.9,
+            emissiveIntensity: 0.65,
             arcLines: pulseLegs.map((l) => {
               const arcLen = l.len * ARC_LEN_FACTOR;
               const dashSize = Math.max(arcLen * 0.05, 1_200);
@@ -431,7 +470,7 @@ export class Globe {
                 ] satisfies LatLng[],
                 srcColor: new Color().setStyle("#ffffff"),
                 tgtColor: new Color().setStyle("#ffffff"),
-                thickness: 2.6,
+                thickness: 2.1,
                 segments: 96,
                 arcHeightScale: 0.35,
                 dashed: true,
@@ -516,7 +555,8 @@ export class Globe {
     return document.visibilityState === "hidden" ? 0 : ms;
   }
 
-  async flyToNode(node: ChainNode, distance = 2_200_000): Promise<void> {
+  /** 地点クリック時のフライ。詳細マップが出る高度まで寄る */
+  async flyToNode(node: ChainNode, distance = 550_000): Promise<void> {
     if (!this.ready) return;
     await this.view.flyTo(
       { lng: node.lng, lat: node.lat, distance, heading: 0, pitch: -68, roll: 0 },
