@@ -336,7 +336,8 @@ export class Globe {
           radiusTop: 1,
           radiusBottom: 1,
           radialSegments: 48,
-          color: new Color().setStyle("#050a12"),
+          // Black Marble の北極域の色調に寄せて悪目立ちしないように
+          color: new Color().setStyle("#101827"),
           children: [{ radius: 650_000, height: 530_000 }],
         },
       });

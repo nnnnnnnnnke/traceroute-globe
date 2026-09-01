@@ -1,87 +1,110 @@
 # Traceroute Globe
 
-traceroute の経由結果を [Navara](https://navara.world/)(オープンソースの 3D 地球儀マップエンジン)で可視化するローカルツール。
-夜の地球 (NASA Black Marble) の上に、ホップ間の経路を発光するアークで描く。
+**[日本語版 README はこちら / Japanese README](README.ja.md)**
 
-## 使い方
+Visualize traceroute paths on a photorealistic 3D night globe, powered by
+[Navara](https://navara.world/) — an open-source 3D map engine (Rust/WASM + Three.js).
+
+Run a live traceroute and watch the route light up hop by hop across the planet,
+compare IPv4 vs IPv6 paths side by side, and read the AS-level path at a glance.
+
+![Dual-stack traceroute to ftp.funet.fi — IPv6 (orange) crosses the Arctic via NORDUnet while IPv4 (cyan) crosses the US via Arelion](docs/screenshot-hero.png)
+
+## Features
+
+- **Live mode** — runs `traceroute` / `traceroute6` (ICMP or UDP) behind a local
+  dev server and streams hops over SSE. Each hop is geolocated, reverse-resolved,
+  and drawn onto the globe in real time with a follow camera
+- **Dual-stack comparison** — the "Both" option traces IPv4 and IPv6
+  simultaneously and draws them in different colors. On many access networks the
+  two families take completely different paths, and it shows
+- **AS path strip** — hops grouped by origin AS
+  (`AS2914 NTT → AS1299 Arelion → AS2603 NORDUnet → AS1741 FUNET`), with each
+  block linking to [bgp.tools](https://bgp.tools)
+- **Path statistics** — geodesic path length, the speed-of-light-in-fiber
+  round-trip lower bound (≈ 200,000 km/s), and measured RTT with a path
+  efficiency percentage
+- **Paste mode** — paste output from `traceroute`, Windows `tracert`
+  (English/Japanese), or `mtr --report` captured on any machine
+- **History overlays** — finished traces are kept in `localStorage` (up to 20);
+  click to overlay up to 4 traces in different colors for comparison
+- **Detail zoom** — NASA Black Marble for the overview, cross-fading into an
+  OSM-based dark basemap (up to street level) as you zoom in, with
+  precisely-connected ground tracks and hop markers
+
+![Zoomed in to the San Francisco Bay Area — ground tracks connect the San Jose and Palo Alto hops at street level](docs/screenshot-detail.png)
+
+## Quick start
 
 ```sh
 npm install
 npm run dev
 ```
 
-ブラウザで http://localhost:5173 (Vite の表示ポート) を開く。
+Open the URL Vite prints (e.g. http://localhost:5173).
 
-### 実行モード
+- **Live mode** requires macOS (it spawns the system `traceroute` /
+  `traceroute6`). ICMP mode is recommended; on IPoE/DS-Lite-style access lines
+  IPv4 transit hops rarely answer, so IPv6 usually shows a much better path
+- **Paste mode** works anywhere. No traceroute at hand? Paste
+  [docs/demo-v6.txt](docs/demo-v6.txt) or [docs/demo-v4.txt](docs/demo-v4.txt)
+  (sanitized real-world traces to ftp.funet.fi)
 
-ホスト名 / IP を入れて「トレース開始」。Vite の開発サーバが macOS の
-`traceroute` / `traceroute6` を実行し、結果を SSE でストリームして、
-ホップが見つかるたびに地球儀へリアルタイムに追加される。
+## Reading the picture
 
-- **IPv4 / IPv6 / 両方** — `traceroute` / `traceroute6` の切り替え。
-  **「両方」は同時に2本実行して色分け描画** (デュアルスタック経路比較)。
-  フレッツ系 IPoE だと v4 と v6 で経路がまったく違うのが一目で見える
-- **ICMP / UDP** — ICMP (`-I`) 推奨。IPoE の IPv4 は中間ホップがほぼ応答しない
-- **追従** — 新しいホップにカメラが自動でフライする。ドラッグすると解除
-- **プリセット** — funet / he.net / routeviews / fau / aarnet / wide のワンタップ入力
+| Element | Meaning |
+| --- | --- |
+| Solid arc | Segment between hops with consecutive TTLs |
+| Dashed arc | Segment spanning unlocatable hops (`*` timeouts, private/CGN addresses) |
+| Thin ground line | Exact great-circle ground track (takes over from the arcs as you zoom in) |
+| Colors | One color slot per trace: cyan → orange → violet → green |
+| Large dot | Destination |
+| White pulse | Decorative packet pulse along solid segments |
 
-### 貼り付けモード
+Nearby hops (< 5 km) collapse into one site, labeled like `8–9 Chiyoda City`.
+The right panel lists every hop (IP, rDNS, city, ASN, RTT) — click one to fly
+there. Note that IP geolocation is city-level at best and can be wrong,
+especially for anycast destinations.
 
-別マシンで採った出力をそのまま貼り付けて「可視化する」。
-`traceroute` / Windows `tracert`(日本語出力含む)/ `mtr --report` をパースできる。
-
-### 履歴
-
-完了したトレースは localStorage に保存され (最大20件)、左パネルの履歴を
-クリックすると現在の表示に**重ね描き**できる (最大4本、色スロット自動割当)。
-時間帯や回線を変えて同じ宛先を比較する用途を想定。
-
-## 表示
-
-- **ズーム** — 俯瞰では NASA Black Marble (夜の光)、寄ると OSM ベースの
-  詳細ダークマップ (maxzoom 22) へ高度連動でクロスフェード。ホップの行や
-  チップをクリックすると詳細が見える高度 (約550km) までフライする
-- **地球儀** — 実線アーク = TTL 連続区間 / 破線アーク = 位置不明ホップ
-  (`*` やプライベート・CGN) を跨いだ区間。トレースごとに色分け
-  (シアン → オレンジ → バイオレット → グリーン)、宛先は大きい点。
-  実線区間には流れるパケットパルス
-- **右パネル** — トレースごとのセクションに全ホップ (IP / 逆引き / 都市 /
-  ASN / RTT)。クリックでその地点へフライ。ヘッダには経路統計:
-  `経路 ≥ 19,535 km · 光理論 ≥ 195.3 ms · 実測 275.0 ms (効率 71%)`
-  (判明地点間の測地距離と、光ファイバ中の光速 ≈ 200,000 km/s による往復理論値)
-- **AS パス** (画面下) — ホップを AS 単位でグルーピングした線形図。
-  `AS4713 OCN → ✕ → AS2914 NTT → AS2603 NORDUnet → AS1741 FUNET` のように
-  経路の AS 遷移が読める。AS ブロックのクリックで bgp.tools が開く
-- 近接ホップ (5km 未満) は 1 地点にまとめ、チップに `8–9 Chiyoda City` の
-  ように TTL 範囲で表示
-
-## 仕組み
+## How it works
 
 ```
-ブラウザ (Vite + TypeScript + @navaramap/three)
-  ├─ GET /api/trace   … traceroute を spawn し SSE でホップ+ジオ情報+逆引きを配信
-  ├─ POST /api/enrich … 貼り付けモード用の一括ジオロケーション+逆引き
-  └─ GET /api/self    … 発信元 (自分のグローバル IP) の位置
-サーバ側 (server/api.ts, Vite プラグインの configureServer ミドルウェア)
-  └─ ジオロケーションは ip-api.com の batch API (45req/分制限のため 300ms 窓でまとめ、キャッシュ)
+Browser (Vite + TypeScript + @navaramap/three)
+  ├─ GET /api/trace    spawn traceroute, stream hops + geo + rDNS over SSE
+  ├─ POST /api/enrich  batch geolocation + rDNS for paste mode
+  └─ GET /api/self     geolocate the local egress IP (origin marker)
+Server side (server/api.ts, a Vite dev-server middleware)
+  └─ geolocation via ip-api.com /batch — throttled to its 15 req/min limit,
+     micro-batched and cached
 ```
 
-Navara 側の主な構成 (src/globe.ts):
+On the Navara side: Black Marble raster + an OSM dark style cross-faded by
+camera altitude, `ArclineMeshDesc` arcs with selective bloom, clamped-to-ground
+GeoJSON tracks/points, and DOM hop chips projected each frame via
+`OverlayPlugin` (hidden behind the horizon by a camera-altitude test).
 
-- ベースマップ: Black Marble 2016 (Re:Earth Papers の TileJSON)
-- `GlowGlobeMeshDesc` で大気のリムグロー、`SelectiveBloomEffectDesc` でアークとポイントを発光
-- アークは `ArclineMeshDesc` の config 配列 (1 区間 = 1 config で実線/破線を切り替え)
-- ホップのラベルは `OverlayPlugin` で毎フレーム投影する DOM チップ
-  (カメラ高度から地平線距離を計算して、地球の裏に回った地点は非表示)
+This is a local tool: the dev server executes `traceroute` for whatever host the
+page asks for. Don't expose it beyond localhost.
 
-## 注意
+## Notes
 
-- ip-api.com の無料枠は非商用限定・HTTP のみ (サーバ側から叩くのでブラウザには影響しない)
-- ジオロケーションは目安。とくに anycast (1.1.1.1 など) は実際と違う場所に出ることがある
-- ArcLine は約 2km 未満の区間を描画できないため、近接地点はまとめている
+- ip-api.com's free tier is for non-commercial use, HTTP-only (called
+  server-side), and rate-limited — handled, but heavy use may still show
+  "位置情報なし" temporarily
+- Arcs are drawn in world space and can drift a few km against the basemap at
+  street-level zoom (an upstream ArcLine precision trait) — that's why they fade
+  out below ~400 km altitude and hand over to the exact ground tracks
+- `docs/screenshot-*.png` can be regenerated with
+  `node scripts/capture-screenshots.mjs` (needs Chrome and a running dev server)
 
-## クレジット
+## Credits
 
-- 地図エンジン: [Navara](https://github.com/eukarya-inc/navara) (MIT / Apache-2.0)
-- タイル: [Re:Earth Papers](https://papers.reearth.land/attribution) — NASA Earth Observatory "Earth at Night 2016" (public domain)
-- IP ジオロケーション: [ip-api.com](https://ip-api.com)
+- Map engine: [Navara](https://github.com/eukarya-inc/navara) (MIT / Apache-2.0)
+- Tiles: [Re:Earth Papers](https://papers.reearth.land/attribution) — NASA Earth
+  Observatory "Earth at Night 2016" (public domain) and an OSM-based dark style
+  (© OpenStreetMap contributors)
+- IP geolocation: [ip-api.com](https://ip-api.com)
+
+## License
+
+[MIT](LICENSE)
