@@ -137,6 +137,43 @@ export function nodeLabel(node: ChainNode): string {
   return `${range} ${place}`;
 }
 
+/** 大円に沿って2点間をサンプリングした [lng, lat] 列 (地表トラック描画用) */
+export function greatCirclePoints(
+  a: { lat: number; lng: number },
+  b: { lat: number; lng: number },
+  lenMeters: number,
+): [number, number][] {
+  const rad = Math.PI / 180;
+  const deg = 180 / Math.PI;
+  const toVec = (lat: number, lng: number): [number, number, number] => [
+    Math.cos(lat * rad) * Math.cos(lng * rad),
+    Math.cos(lat * rad) * Math.sin(lng * rad),
+    Math.sin(lat * rad),
+  ];
+  const va = toVec(a.lat, a.lng);
+  const vb = toVec(b.lat, b.lng);
+  const dot = Math.min(1, Math.max(-1, va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]));
+  const omega = Math.acos(dot);
+  const n = Math.min(128, Math.max(2, Math.round(lenMeters / 50_000)));
+  const points: [number, number][] = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    let x: number, y: number, z: number;
+    if (omega < 1e-9) {
+      [x, y, z] = va;
+    } else {
+      const s = Math.sin(omega);
+      const w1 = Math.sin((1 - t) * omega) / s;
+      const w2 = Math.sin(t * omega) / s;
+      x = w1 * va[0] + w2 * vb[0];
+      y = w1 * va[1] + w2 * vb[1];
+      z = w1 * va[2] + w2 * vb[2];
+    }
+    points.push([Math.atan2(y, x) * deg, Math.asin(z / Math.hypot(x, y, z)) * deg]);
+  }
+  return points;
+}
+
 export function flagEmoji(countryCode?: string): string {
   if (!countryCode || !/^[A-Z]{2}$/i.test(countryCode)) return "";
   return String.fromCodePoint(
@@ -183,12 +220,15 @@ export class Globe {
   private pulseSteps: number[] = [];
   private waySources: SourceHandle[] = [];
   private destSources: SourceHandle[] = [];
+  private trackSources: SourceHandle[] = [];
   private chipRoot!: HTMLElement;
   private chips = new Map<string, HTMLElement>();
   private chains: ChainLayer[] = [];
   private onNodeClick: ((node: ChainNode) => void) | null = null;
   private ready = false;
   private pendingChains: ChainLayer[] | null = null;
+  /** アーク/パルスの不透明度。近距離ではズレが見えるためフェードアウトする */
+  private flightOpacity = 1;
 
   async init(container: HTMLElement, chipRoot: HTMLElement): Promise<void> {
     this.chipRoot = chipRoot;
@@ -256,7 +296,14 @@ export class Globe {
     let lastDetailOp = -1;
     let lastGlowOp = -1;
     const applyLod = () => {
-      const h = this.view.camera.positionGeographic.height;
+      let h: number;
+      try {
+        // カメラの WASM コアは view.init() 直後はまだ未接続のことがあり、
+        // その間 positionGeographic は throw する (次の move イベントで再試行)
+        h = this.view.camera.positionGeographic.height;
+      } catch {
+        return;
+      }
       const t = Math.min(1, Math.max(0, (DETAIL_START - h) / (DETAIL_START - DETAIL_FULL)));
       const detailOp = Math.round(t * 20) / 20;
       if (detailOp !== lastDetailOp) {
@@ -272,6 +319,9 @@ export class Globe {
         lastGlowOp = glowOp;
         glow.update({ glowGlobe: { opacity: glowOp } });
       }
+      // アークはワールド座標描画のため近距離では地表と数kmずれて見える。
+      // 高度400km以下でフェードし、地表トラック+ドットに引き継ぐ
+      this.flightOpacity = Math.min(1, Math.max(0, (h - 130_000) / (400_000 - 130_000)));
     };
     view.camera.on("move", applyLod);
     applyLod();
@@ -297,8 +347,24 @@ export class Globe {
     });
     this.bloomId = bloom.id;
 
-    // 色スロットごとのホップ地点ポイント (経由地 + 宛先)
+    // 色スロットごとのホップ地点ポイント (経由地 + 宛先)。
+    // clampToGround + offsetDepth で、ズームインしても地表に埋まらないようにする
     for (const c of TRACE_COLORS) {
+      // 地表トラック: アーク (ワールド座標メッシュ) はズームインすると地点と
+      // 数kmずれて見えることがあるため、タイルと同じ描画パイプラインを通る
+      // clampToGround のポリラインで「正確に繋がった」線を地表に敷く
+      const track = view.addSource({ type: "geojson", data: emptyLineFC() });
+      view.addLayer({
+        type: "vector",
+        source: track,
+        polyline: {
+          color: new Color().setStyle(c.arcTgt),
+          width: 2,
+          clampToGround: true,
+        },
+      });
+      this.trackSources.push(track);
+
       const way = view.addSource({ type: "geojson", data: emptyFC() });
       view.addLayer({
         type: "vector",
@@ -308,6 +374,8 @@ export class Globe {
           size: 9,
           sizeInMeters: false,
           declutter: false,
+          clampToGround: true,
+          offsetDepth: true,
           effectIds: [this.bloomId],
           emissiveIntensity: 0.35,
         },
@@ -322,6 +390,8 @@ export class Globe {
           size: 13,
           sizeInMeters: false,
           declutter: false,
+          clampToGround: true,
+          offsetDepth: true,
           effectIds: [this.bloomId],
           emissiveIntensity: 0.55,
         },
@@ -334,19 +404,34 @@ export class Globe {
       this.animTick++;
       if (this.arcs && this.arcSteps.length > 0) {
         this.arcs.update({
-          arcLines: this.arcSteps.map((s) => ({ dashOffset: -this.animTick * s })),
+          // 不透明度だけでなくブルーム源 (emissive) も一緒に絞らないと、
+          // フェード後も発光の残光が残る
+          emissiveIntensity: 0.45 * this.flightOpacity,
+          arcLines: this.arcSteps.map((s) => ({
+            dashOffset: -this.animTick * s,
+            opacity: this.flightOpacity,
+          })),
         });
       }
       if (this.pulse && this.pulseSteps.length > 0) {
         this.pulse.update({
-          arcLines: this.pulseSteps.map((s) => ({ dashOffset: -this.animTick * s })),
+          emissiveIntensity: 0.65 * this.flightOpacity,
+          arcLines: this.pulseSteps.map((s) => ({
+            dashOffset: -this.animTick * s,
+            opacity: this.flightOpacity,
+          })),
         });
       }
     });
 
     // DOMチップの毎フレーム再配置 (地平線の裏に回った地点は隠す)
     this.overlay.onUpdate(({ projected }) => {
-      const camH = this.view.camera.positionGeographic.height;
+      let camH: number;
+      try {
+        camH = this.view.camera.positionGeographic.height;
+      } catch {
+        return; // カメラコア未接続の間はスキップ
+      }
       const horizon = Math.sqrt((EARTH_R + camH) ** 2 - EARTH_R ** 2) * 1.01;
       for (const [id, el] of this.chips) {
         const pos = projected.get(id);
@@ -412,6 +497,20 @@ export class Globe {
       .join("|");
     if (shapeKey !== this.arcShapeKey) {
       this.arcShapeKey = shapeKey;
+
+      // 地表トラック (スロット別) を更新
+      const trackBySlot = new Map<number, ReturnType<typeof lineFeature>[]>();
+      for (const l of legs) {
+        const list = trackBySlot.get(l.slot) ?? [];
+        list.push(lineFeature(greatCirclePoints(l.a, l.b, l.len)));
+        trackBySlot.set(l.slot, list);
+      }
+      for (let slot = 0; slot < TRACE_COLORS.length; slot++) {
+        this.trackSources[slot]?.update({
+          type: "geojson",
+          data: lineFC(trackBySlot.get(slot) ?? []),
+        });
+      }
       this.arcs?.delete();
       this.arcs = null;
       this.pulse?.delete();
@@ -422,6 +521,13 @@ export class Globe {
         // ダッシュ模様はシェーダ側で「弧長」に沿って刻まれる。弧長は
         // arcHeightScale 0.35 のとき測地距離の約1.30倍 (実装の円弧近似より)
         const ARC_LEN_FACTOR = 1.3;
+        // セグメント数は区間長に応じて増やす (一律だと長距離アークの末端が
+        // ズームイン時に粗く折れて、地点に届いていないように見える)
+        const segmentsFor = (len: number) =>
+          Math.min(512, Math.max(48, Math.round(len / 25_000)));
+        // ダッシュは区間長比例 + 上限 (長距離区間で「空白」が数百kmになり、
+        // ズームインすると線が消えて見えるのを防ぐ)
+        const dashSizeFor = (len: number) => Math.min(Math.max(len / 14, 2_500), 120_000);
         const configs = legs.map((l) => ({
           geometry: [
             { lng: l.a.lng, lat: l.a.lat },
@@ -430,21 +536,19 @@ export class Globe {
           srcColor: new Color().setStyle(TRACE_COLORS[l.slot].arcSrc),
           tgtColor: new Color().setStyle(TRACE_COLORS[l.slot].arcTgt),
           thickness: l.dashed ? 1.2 : 1.7,
-          segments: 96,
+          segments: segmentsFor(l.len),
           arcHeightScale: 0.35,
           gradation: 0.35,
+          transparent: true,
+          opacity: this.flightOpacity,
           dashed: l.dashed,
-          // 区間長に比例させる (絶対値の下限を大きくすると短い区間がダッシュ1周期に
-          // 収まってしまい、dashOffset アニメーションで丸ごと明滅する)
-          dashSize: Math.max(l.len / 14, 2_500),
-          gapSize: Math.max(l.len / 28, 1_250),
+          dashSize: dashSizeFor(l.len),
+          gapSize: dashSizeFor(l.len) / 2,
           dashOffset: 0,
         }));
         // 破線の行進速度は周期に比例 (3秒で1周期)。実線は例に倣った定速スイープ
         this.arcSteps = legs.map((l) =>
-          l.dashed
-            ? (Math.max(l.len / 14, 2_500) + Math.max(l.len / 28, 1_250)) / 180
-            : 4_000,
+          l.dashed ? (dashSizeFor(l.len) * 1.5) / 180 : 4_000,
         );
         this.arcs = this.view.addMesh<ArclineMeshDesc>({
           effectIds: [this.bloomId],
@@ -471,8 +575,10 @@ export class Globe {
                 srcColor: new Color().setStyle("#ffffff"),
                 tgtColor: new Color().setStyle("#ffffff"),
                 thickness: 2.1,
-                segments: 96,
+                segments: segmentsFor(l.len),
                 arcHeightScale: 0.35,
+                transparent: true,
+                opacity: this.flightOpacity,
                 dashed: true,
                 dashSize,
                 // 周期 = 弧長ちょうどにして、常にパルスが1つだけ見えるようにする
@@ -564,9 +670,13 @@ export class Globe {
     );
   }
 
-  /** 指定チェーンの最新ホップに追従: 直前の区間が見える距離でフライ */
+  /** 指定チェーンの最新ホップに追従: 直前の区間が見える距離でフライ。
+   *  ホップ到着のたびにカメラが揺れないよう、フライ中+短い休止の間は
+   *  次の追従を発火しない (完了後に届いたホップは次回の追従で追いつく) */
+  private followBusy = false;
+
   followLatest(chainId: string): void {
-    if (!this.ready) return;
+    if (!this.ready || this.followBusy) return;
     const nodes = this.chains.find((c) => c.id === chainId)?.nodes ?? [];
     const n = nodes.length;
     if (n === 0) return;
@@ -580,10 +690,18 @@ export class Globe {
         11_000_000,
       );
     }
-    void this.view.flyTo(
-      { lng: node.lng, lat: node.lat, distance, heading: 0, pitch: -75, roll: 0 },
-      { duration: this.flyDuration(1400) },
-    );
+    this.followBusy = true;
+    void this.view
+      .flyTo(
+        { lng: node.lng, lat: node.lat, distance, heading: 0, pitch: -75, roll: 0 },
+        { duration: this.flyDuration(2_000), easing: "cubicInOut" },
+      )
+      .finally(() => {
+        // フライ完了後も1秒は静止させる
+        setTimeout(() => {
+          this.followBusy = false;
+        }, 1_000);
+      });
   }
 
   /** 表示中の全経路が収まるように俯瞰 */
@@ -647,4 +765,20 @@ function fc(features: ReturnType<typeof pointFeature>[]) {
 
 function emptyFC() {
   return fc([]);
+}
+
+function lineFeature(coords: [number, number][]) {
+  return {
+    type: "Feature" as const,
+    properties: {},
+    geometry: { type: "LineString" as const, coordinates: coords },
+  };
+}
+
+function lineFC(features: ReturnType<typeof lineFeature>[]) {
+  return { type: "FeatureCollection" as const, features };
+}
+
+function emptyLineFC() {
+  return lineFC([]);
 }

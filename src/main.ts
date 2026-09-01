@@ -890,4 +890,8 @@ function createChipRoot(): HTMLElement {
   return root;
 }
 
-void boot();
+void boot().catch((e: unknown) => {
+  console.error("初期化に失敗しました:", e);
+  (window as unknown as { __bootError?: string }).__bootError =
+    e instanceof Error ? (e.stack ?? String(e)) : String(e);
+});
