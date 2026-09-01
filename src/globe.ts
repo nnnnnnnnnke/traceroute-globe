@@ -1,6 +1,7 @@
 import ThreeView, { Color, type LatLng } from "@navaramap/three";
 import type {
   ArclineMeshDesc,
+  CylinderMeshDesc,
   GlowGlobeMeshDesc,
   SelectiveBloomEffectDesc,
 } from "@navaramap/three-default-descs";
@@ -216,6 +217,10 @@ export class Globe {
       roll: 0,
     });
 
+    // タイルの無い領域 (Black Marble は ±85° まで。極冠など) が明るい既定色で
+    // 出ないように、地球のベース色を夜景に合わせた暗色にする
+    view.globe.color = new Color().setStyle("#050a12");
+
     // 夜の地球 (NASA Black Marble) + 大気のフレネルグロー
     const basemap = await tilejson.addSource({
       type: "raster-tile",
@@ -232,6 +237,21 @@ export class Globe {
         opacity: 0.9,
       },
     });
+
+    // メルカトルタイルは ±85.05° まで。極に開いた穴からグロー殻の内側が
+    // 明るい円盤として見えてしまうため、両極を暗い薄型シリンダーで塞ぐ
+    for (const lat of [90, -90]) {
+      view.addMesh<CylinderMeshDesc>({
+        geodetic: { lat, lng: 0, height: -20_000 },
+        cylinders: {
+          radiusTop: 1,
+          radiusBottom: 1,
+          radialSegments: 48,
+          color: new Color().setStyle("#050a12"),
+          children: [{ radius: 650_000, height: 40_000 }],
+        },
+      });
+    }
 
     const bloom = view.addEffect<SelectiveBloomEffectDesc>({
       selectiveBloom: { strength: 1.0, radius: 0.5, threshold: 0 },
