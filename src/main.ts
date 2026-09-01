@@ -40,6 +40,9 @@ interface Trace {
   ts: number;
   saved: boolean;
   lastChainLen: number;
+  /** 発信元 (このマシンの現在地) を経路の起点として描くか。
+   *  他所で採取した貼り付け・履歴では実在しない区間になるため false */
+  useOrigin: boolean;
 }
 
 const traces = new Map<string, Trace>();
@@ -47,6 +50,7 @@ const geoByIp = new Map<string, GeoInfo>();
 const rdnsByIp = new Map<string, string>();
 let origin: OriginInfo | null = null;
 let follow = true;
+let uiMessage: string | null = null; // 一時的な操作エラー等の表示 (renderStatus が描画)
 
 const globe = new Globe();
 if (import.meta.env.DEV) {
@@ -215,14 +219,19 @@ function renderStatus() {
   runButton.textContent = running ? "停止" : "トレース開始";
   runButton.classList.toggle("danger", running);
 
+  if (uiMessage) statusBox.hidden = false;
   statusLine.innerHTML = "";
   const dot = document.createElement("span");
   dot.className = running ? "dot dot-run" : "dot";
   statusLine.append(dot);
-  const text = list
-    .map((t) => `${familyBadge(t.family)}: ${t.status === "error" ? "エラー" : statusShort(t)}`)
-    .join(" · ");
-  statusLine.append(document.createTextNode(" " + (text || "-")));
+  const text = list.map((t) => `${familyBadge(t.family)}: ${statusShort(t)}`).join(" · ");
+  statusLine.append(document.createTextNode(" " + (text || uiMessage || "-")));
+  if (uiMessage && text) {
+    const warn = document.createElement("span");
+    warn.className = "ui-message";
+    warn.textContent = uiMessage;
+    statusLine.append(warn);
+  }
   const label = document.createElement("label");
   label.className = "follow";
   const cb = document.createElement("input");
@@ -248,7 +257,7 @@ function geoText(geo: GeoInfo | undefined): string {
 }
 
 function chainOf(t: Trace): ChainNode[] {
-  return buildChain(sortedHops(t), origin, t.targetIp);
+  return buildChain(sortedHops(t), t.useOrigin ? origin : null, t.targetIp);
 }
 
 /** 距離と光ファイバ理論RTTの統計行 */
@@ -373,7 +382,7 @@ function renderHopPanel() {
 // ---------------------------------------------------------------------------
 
 interface AsBlock {
-  kind: "as" | "private" | "lost";
+  kind: "as" | "private" | "lost" | "pending" | "noas";
   asId?: string; // 例: AS4713
   orgName?: string;
   hops: Hop[];
@@ -394,8 +403,12 @@ function buildAsBlocks(t: Trace): AsBlock[] {
       const sp = hop.geo.as.indexOf(" ");
       asId = sp > 0 ? hop.geo.as.slice(0, sp) : hop.geo.as;
       orgName = sp > 0 ? hop.geo.as.slice(sp + 1) : hop.geo.org || hop.geo.isp;
+    } else if (hop.geo?.status === "ok") {
+      kind = "noas"; // 位置は分かるがAS情報がない
+    } else if (!hop.geo) {
+      kind = "pending"; // 応答はあったがジオ情報が未着 — タイムアウトの ✕ とは区別する
     } else {
-      kind = "lost"; // 位置/AS不明はロスト扱いでまとめる
+      kind = "lost"; // ジオ取得失敗
     }
     const last = blocks[blocks.length - 1];
     if (last && last.kind === kind && last.asId === asId) {
@@ -443,7 +456,15 @@ function renderAsMap() {
       const label = document.createElement("span");
       label.className = "as-label";
       label.textContent =
-        b.kind === "as" ? (b.asId ?? "AS?") : b.kind === "private" ? "Private/CGN" : "✕";
+        b.kind === "as"
+          ? (b.asId ?? "AS?")
+          : b.kind === "private"
+            ? "Private/CGN"
+            : b.kind === "noas"
+              ? "AS不明"
+              : b.kind === "pending"
+                ? "取得中…"
+                : "✕";
       el.append(label);
       if (b.kind === "as" && b.orgName) {
         const org = document.createElement("span");
@@ -581,6 +602,7 @@ function removeTrace(id: string) {
 function clearTraces() {
   for (const t of traces.values()) t.handle?.stop();
   traces.clear();
+  uiMessage = null;
   globe.reset();
   renderAll();
 }
@@ -604,11 +626,12 @@ function completeAndSave(t: Trace) {
     .filter((h) => h.ip && (!h.geo || h.geo.status === "fail"))
     .map((h) => h.ip as string);
   const finish = () => {
+    // 履歴保存は、enrich 待ちの間に表示から消されたトレースでも行う
+    saveHistoryRecord(t);
     if (traces.get(t.id) !== t) return;
     renderAll();
     updateGlobe();
     if (follow && !anyRunning()) globe.fitAll();
-    saveHistoryRecord(t);
   };
   if (missing.length === 0) {
     finish();
@@ -644,6 +667,7 @@ function addLiveTrace(host: string, family: 4 | 6, proto: "icmp" | "udp") {
     ts: Date.now(),
     saved: false,
     lastChainLen: 0,
+    useOrigin: true,
   };
   traces.set(t.id, t);
   t.handle = startTrace({ host, v6: family === 6, proto }, (ev) => {
@@ -731,6 +755,7 @@ function addHistoryTrace(rec: TraceRecord) {
     ts: rec.ts,
     saved: true,
     lastChainLen: 0,
+    useOrigin: false,
   };
   traces.set(t.id, t);
   updateGlobe();
@@ -763,9 +788,8 @@ pasteForm.addEventListener("submit", (e) => {
   const text = $<HTMLTextAreaElement>("#paste-text").value;
   const parsed = parseTraceText(text);
   if (parsed.hops.length === 0) {
+    uiMessage = "ホップ行を読み取れませんでした";
     renderAll();
-    statusBox.hidden = false;
-    statusLine.textContent = "ホップ行を読み取れませんでした";
     return;
   }
   clearTraces();
@@ -785,6 +809,7 @@ pasteForm.addEventListener("submit", (e) => {
     ts: Date.now(),
     saved: false,
     lastChainLen: 0,
+    useOrigin: false,
   };
   if (t.slot < 0) return;
   traces.set(t.id, t);
@@ -840,6 +865,9 @@ async function boot() {
         geo: { ...geo, status: "ok" },
         label: `発信元${geo.city ? ` (${geo.city})` : ""}`,
       };
+      // origin 確定より先に描画が済んだトレースへ発信元を反映
+      renderAll();
+      updateGlobe();
     }
   } catch {
     /* オフラインでも動くように */

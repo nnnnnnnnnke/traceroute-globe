@@ -611,6 +611,18 @@ a.as-block:hover {
 .as-lost {
   opacity: 0.55;
 }
+.as-pending {
+  opacity: 0.7;
+  border-style: dashed;
+}
+.as-noas .as-label {
+  color: var(--ink-2);
+}
+.ui-message {
+  color: var(--danger);
+  font-size: 12px;
+  margin-left: 6px;
+}
 .as-org {
   font-size: 10px;
   color: var(--ink-3);

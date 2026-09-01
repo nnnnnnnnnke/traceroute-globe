@@ -174,17 +174,17 @@ export class Globe {
   private overlay!: OverlayPlugin;
   private bloomId!: string;
   private arcs: DescHandle | null = null;
-  private arcCount = 0;
   private arcShapeKey = "";
   private pulse: DescHandle | null = null;
-  private pulseCount = 0;
+  private animTick = 0;
+  /** 区間ごとの dashOffset 前進量 (m/フレーム)。周期に比例させてストロボ化を防ぐ */
+  private arcSteps: number[] = [];
+  private pulseSteps: number[] = [];
   private waySources: SourceHandle[] = [];
   private destSources: SourceHandle[] = [];
   private chipRoot!: HTMLElement;
   private chips = new Map<string, HTMLElement>();
   private chains: ChainLayer[] = [];
-  private dashOffset = 0;
-  private pulseOffset = 0;
   private onNodeClick: ((node: ChainNode) => void) | null = null;
   private ready = false;
   private pendingChains: ChainLayer[] | null = null;
@@ -272,20 +272,15 @@ export class Globe {
 
     // アークの流線 + パケットパルスのアニメーション
     view.on("preUpdate", () => {
-      this.dashOffset -= 4000;
-      this.pulseOffset -= 18_000;
-      if (this.arcs && this.arcCount > 0) {
+      this.animTick++;
+      if (this.arcs && this.arcSteps.length > 0) {
         this.arcs.update({
-          arcLines: Array.from({ length: this.arcCount }, () => ({
-            dashOffset: this.dashOffset,
-          })),
+          arcLines: this.arcSteps.map((s) => ({ dashOffset: -this.animTick * s })),
         });
       }
-      if (this.pulse && this.pulseCount > 0) {
+      if (this.pulse && this.pulseSteps.length > 0) {
         this.pulse.update({
-          arcLines: Array.from({ length: this.pulseCount }, () => ({
-            dashOffset: this.pulseOffset,
-          })),
+          arcLines: this.pulseSteps.map((s) => ({ dashOffset: -this.animTick * s })),
         });
       }
     });
@@ -362,8 +357,12 @@ export class Globe {
       this.arcs = null;
       this.pulse?.delete();
       this.pulse = null;
-      this.arcCount = legs.length;
+      this.arcSteps = [];
+      this.pulseSteps = [];
       if (legs.length > 0) {
+        // ダッシュ模様はシェーダ側で「弧長」に沿って刻まれる。弧長は
+        // arcHeightScale 0.35 のとき測地距離の約1.30倍 (実装の円弧近似より)
+        const ARC_LEN_FACTOR = 1.3;
         const configs = legs.map((l) => ({
           geometry: [
             { lng: l.a.lng, lat: l.a.lat },
@@ -380,41 +379,50 @@ export class Globe {
           // 収まってしまい、dashOffset アニメーションで丸ごと明滅する)
           dashSize: Math.max(l.len / 14, 2_500),
           gapSize: Math.max(l.len / 28, 1_250),
-          dashOffset: this.dashOffset,
+          dashOffset: 0,
         }));
+        // 破線の行進速度は周期に比例 (3秒で1周期)。実線は例に倣った定速スイープ
+        this.arcSteps = legs.map((l) =>
+          l.dashed
+            ? (Math.max(l.len / 14, 2_500) + Math.max(l.len / 28, 1_250)) / 180
+            : 4_000,
+        );
         this.arcs = this.view.addMesh<ArclineMeshDesc>({
           effectIds: [this.bloomId],
           emissiveIntensity: 0.45,
           arcLines: configs,
         }) as unknown as DescHandle;
 
-        // パケットパルス: 実線区間の上を明るい短ダッシュが1つ流れる
+        // パケットパルス: 実線区間の上を明るい短ダッシュがちょうど1つ、約4秒で流れる
         const pulseLegs = legs.filter((l) => !l.dashed);
-        this.pulseCount = pulseLegs.length;
         if (pulseLegs.length > 0) {
+          this.pulseSteps = pulseLegs.map((l) => (l.len * ARC_LEN_FACTOR) / 240);
           this.pulse = this.view.addMesh<ArclineMeshDesc>({
             effectIds: [this.bloomId],
             emissiveColor: new Color().setStyle("#ffffff"),
             emissiveIntensity: 0.9,
-            arcLines: pulseLegs.map((l) => ({
-              geometry: [
-                { lng: l.a.lng, lat: l.a.lat },
-                { lng: l.b.lng, lat: l.b.lat },
-              ] satisfies LatLng[],
-              srcColor: new Color().setStyle("#ffffff"),
-              tgtColor: new Color().setStyle("#ffffff"),
-              thickness: 2.6,
-              segments: 96,
-              arcHeightScale: 0.35,
-              dashed: true,
-              dashSize: Math.max(l.len * 0.045, 1_500),
-              gapSize: l.len * 0.955,
-              dashOffset: this.pulseOffset,
-            })),
+            arcLines: pulseLegs.map((l) => {
+              const arcLen = l.len * ARC_LEN_FACTOR;
+              const dashSize = Math.max(arcLen * 0.05, 1_200);
+              return {
+                geometry: [
+                  { lng: l.a.lng, lat: l.a.lat },
+                  { lng: l.b.lng, lat: l.b.lat },
+                ] satisfies LatLng[],
+                srcColor: new Color().setStyle("#ffffff"),
+                tgtColor: new Color().setStyle("#ffffff"),
+                thickness: 2.6,
+                segments: 96,
+                arcHeightScale: 0.35,
+                dashed: true,
+                dashSize,
+                // 周期 = 弧長ちょうどにして、常にパルスが1つだけ見えるようにする
+                gapSize: arcLen - dashSize,
+                dashOffset: 0,
+              };
+            }),
           }) as unknown as DescHandle;
         }
-      } else {
-        this.pulseCount = 0;
       }
     }
 
