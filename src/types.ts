@@ -26,6 +26,16 @@ export interface TraceMeta {
   cmd?: string;
 }
 
+/** 履歴保存用のトレース1回分のスナップショット */
+export interface TraceRecord {
+  id: string;
+  label: string;
+  family: 4 | 6 | 0; // 0 = 貼り付け等で不明
+  targetIp?: string;
+  ts: number; // epoch ms
+  hops: Hop[];
+}
+
 export type TraceEvent =
   | { type: "cmd"; cmd: string }
   | { type: "start"; target: string; targetIp: string }

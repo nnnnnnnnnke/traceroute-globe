@@ -27,10 +27,12 @@
           spellcheck="false"
           required
         />
+        <div id="presets" class="presets" aria-label="行き先プリセット"></div>
         <div class="opts">
           <div class="seg" id="seg-family">
-            <button type="button" data-value="4" class="active">IPv4</button>
-            <button type="button" data-value="6">IPv6</button>
+            <button type="button" data-value="4">IPv4</button>
+            <button type="button" data-value="6" class="active">IPv6</button>
+            <button type="button" data-value="46">両方</button>
           </div>
           <div class="seg" id="seg-proto">
             <button type="button" data-value="icmp" class="active">ICMP</button>
@@ -54,6 +56,13 @@
         <div id="status-line"></div>
         <code id="cmd-line"></code>
       </div>
+
+      <section id="history-box" hidden>
+        <header>
+          <h2>履歴 <small>クリックで重ね描き</small></h2>
+        </header>
+        <ol id="history-list"></ol>
+      </section>
     </aside>
 
     <aside id="hops" class="panel" hidden>
@@ -61,7 +70,15 @@
         <h2 id="hops-title">経路</h2>
         <button id="fit" title="全体を表示">⤢ 全体</button>
       </header>
-      <ol id="hop-list"></ol>
+      <div id="hop-sections"></div>
+    </aside>
+
+    <aside id="asmap" class="panel" hidden>
+      <header>
+        <h2>AS パス</h2>
+        <button id="asmap-toggle" title="折りたたむ">−</button>
+      </header>
+      <div id="asmap-rows"></div>
     </aside>
 
     <script type="module" src="/src/main.ts"></script>

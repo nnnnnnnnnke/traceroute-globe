@@ -39,7 +39,19 @@ export interface OriginInfo {
   label: string; // 例: "発信元 (OCN)"
 }
 
-function haversine(aLat: number, aLng: number, bLat: number, bLng: number): number {
+/** 地球儀に重ねる1本の経路 */
+export interface ChainLayer {
+  id: string;
+  slot: number; // TRACE_COLORS のインデックス
+  nodes: ChainNode[];
+}
+
+export function haversine(
+  aLat: number,
+  aLng: number,
+  bLat: number,
+  bLng: number,
+): number {
   const rad = Math.PI / 180;
   const dLat = (bLat - aLat) * rad;
   const dLng = (bLng - aLng) * rad;
@@ -98,6 +110,15 @@ export function buildChain(
   return nodes;
 }
 
+/** チェーンの測地距離合計 (m)。判明している地点間のみなので実経路の下限 */
+export function chainDistance(nodes: ChainNode[]): number {
+  let sum = 0;
+  for (let i = 0; i + 1 < nodes.length; i++) {
+    sum += haversine(nodes[i].lat, nodes[i].lng, nodes[i + 1].lat, nodes[i + 1].lng);
+  }
+  return sum;
+}
+
 /** ノード間のTTLが連続していなければ「位置不明ホップを跨いだ区間」= 破線 */
 function isGapLeg(from: ChainNode, to: ChainNode): boolean {
   const a = from.hops[from.hops.length - 1]?.ttl;
@@ -123,17 +144,29 @@ export function flagEmoji(countryCode?: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Globe 本体
+// トレースの色スロット (最大4本を同時表示)
 // ---------------------------------------------------------------------------
 
-const ARC_SRC = "#8be2ff";
-const ARC_TGT = "#0091ff";
-const POINT_COLOR = "#c9ecff";
-const DEST_COLOR = "#ffc247";
+export const TRACE_COLORS = [
+  { name: "cyan", ui: "#38bdf8", arcSrc: "#8be2ff", arcTgt: "#0091ff", point: "#c9ecff", dest: "#4fd6ff" },
+  { name: "orange", ui: "#fb923c", arcSrc: "#ffd9a8", arcTgt: "#ff8c1a", point: "#ffe3bf", dest: "#ffb054" },
+  { name: "violet", ui: "#a78bfa", arcSrc: "#ddd1ff", arcTgt: "#8b5cf6", point: "#e6ddff", dest: "#b18cff" },
+  { name: "green", ui: "#34d399", arcSrc: "#b8f5d9", arcTgt: "#10b981", point: "#ccf7e4", dest: "#4ade80" },
+] as const;
+
+export const MAX_TRACES = TRACE_COLORS.length;
+
+// ---------------------------------------------------------------------------
+// Globe 本体
+// ---------------------------------------------------------------------------
 
 interface DescHandle {
   update(u: object): void;
   delete(): void;
+}
+
+interface SourceHandle {
+  update(u: object): void;
 }
 
 export class Globe {
@@ -143,16 +176,24 @@ export class Globe {
   private arcs: DescHandle | null = null;
   private arcCount = 0;
   private arcShapeKey = "";
-  private pointSource: { update(u: object): void } | null = null;
-  private destSource: { update(u: object): void } | null = null;
+  private pulse: DescHandle | null = null;
+  private pulseCount = 0;
+  private waySources: SourceHandle[] = [];
+  private destSources: SourceHandle[] = [];
   private chipRoot!: HTMLElement;
   private chips = new Map<string, HTMLElement>();
-  private nodes: ChainNode[] = [];
+  private chains: ChainLayer[] = [];
   private dashOffset = 0;
+  private pulseOffset = 0;
   private onNodeClick: ((node: ChainNode) => void) | null = null;
+  private ready = false;
+  private pendingChains: ChainLayer[] | null = null;
 
   async init(container: HTMLElement, chipRoot: HTMLElement): Promise<void> {
     this.chipRoot = chipRoot;
+    // 非表示タブ等で viewport が 0×0 のまま初期化すると ThreeView が throw するため、
+    // コンテナが実サイズを持つまで待つ
+    await waitForSize(container);
     const view = new ThreeView<DefaultDescriptions>({ container });
     this.view = view;
 
@@ -197,42 +238,56 @@ export class Globe {
     });
     this.bloomId = bloom.id;
 
-    // ホップ地点のポイント (経由地: シアン / 宛先: アンバー)
-    this.pointSource = view.addSource({ type: "geojson", data: emptyFC() });
-    view.addLayer({
-      type: "vector",
-      source: this.pointSource as never,
-      point: {
-        color: new Color().setStyle(POINT_COLOR),
-        size: 9,
-        sizeInMeters: false,
-        declutter: false,
-        effectIds: [this.bloomId],
-        emissiveIntensity: 0.35,
-      },
-    });
-    this.destSource = view.addSource({ type: "geojson", data: emptyFC() });
-    view.addLayer({
-      type: "vector",
-      source: this.destSource as never,
-      point: {
-        color: new Color().setStyle(DEST_COLOR),
-        size: 13,
-        sizeInMeters: false,
-        declutter: false,
-        effectIds: [this.bloomId],
-        emissiveIntensity: 0.5,
-      },
-    });
+    // 色スロットごとのホップ地点ポイント (経由地 + 宛先)
+    for (const c of TRACE_COLORS) {
+      const way = view.addSource({ type: "geojson", data: emptyFC() });
+      view.addLayer({
+        type: "vector",
+        source: way,
+        point: {
+          color: new Color().setStyle(c.point),
+          size: 9,
+          sizeInMeters: false,
+          declutter: false,
+          effectIds: [this.bloomId],
+          emissiveIntensity: 0.35,
+        },
+      });
+      this.waySources.push(way);
+      const dest = view.addSource({ type: "geojson", data: emptyFC() });
+      view.addLayer({
+        type: "vector",
+        source: dest,
+        point: {
+          color: new Color().setStyle(c.dest),
+          size: 13,
+          sizeInMeters: false,
+          declutter: false,
+          effectIds: [this.bloomId],
+          emissiveIntensity: 0.55,
+        },
+      });
+      this.destSources.push(dest);
+    }
 
-    // アークの流線アニメーション
+    // アークの流線 + パケットパルスのアニメーション
     view.on("preUpdate", () => {
-      if (!this.arcs || this.arcCount === 0) return;
       this.dashOffset -= 4000;
-      const offs = Array.from({ length: this.arcCount }, () => ({
-        dashOffset: this.dashOffset,
-      }));
-      this.arcs.update({ arcLines: offs });
+      this.pulseOffset -= 18_000;
+      if (this.arcs && this.arcCount > 0) {
+        this.arcs.update({
+          arcLines: Array.from({ length: this.arcCount }, () => ({
+            dashOffset: this.dashOffset,
+          })),
+        });
+      }
+      if (this.pulse && this.pulseCount > 0) {
+        this.pulse.update({
+          arcLines: Array.from({ length: this.pulseCount }, () => ({
+            dashOffset: this.pulseOffset,
+          })),
+        });
+      }
     });
 
     // DOMチップの毎フレーム再配置 (地平線の裏に回った地点は隠す)
@@ -256,32 +311,57 @@ export class Globe {
         attributionHtml: `IP Geolocation by <a href="https://ip-api.com">ip-api.com</a>`,
       },
     ]);
+
+    // 初期化前に届いていた経路を反映
+    this.ready = true;
+    if (this.pendingChains) {
+      const pending = this.pendingChains;
+      this.pendingChains = null;
+      this.setChains(pending);
+    }
   }
 
   setNodeClickHandler(fn: (node: ChainNode) => void): void {
     this.onNodeClick = fn;
   }
 
-  /** 状態全体を反映 (追加のたびに呼ぶ。差分は内部で処理) */
-  setChain(nodes: ChainNode[]): void {
-    this.nodes = nodes;
+  /** 表示する経路の集合をまとめて反映 (差分は内部で処理) */
+  setChains(chains: ChainLayer[]): void {
+    this.chains = chains;
+    if (!this.ready) {
+      // init 完了前 (初期化には数秒かかる) は反映を保留する
+      this.pendingChains = chains;
+      return;
+    }
 
-    // --- アーク ---
-    const legs: { a: ChainNode; b: ChainNode; dashed: boolean; len: number }[] = [];
-    for (let i = 0; i + 1 < nodes.length; i++) {
-      const a = nodes[i];
-      const b = nodes[i + 1];
-      const len = haversine(a.lat, a.lng, b.lat, b.lng);
-      if (len < 2_500) continue; // ArcLine の精度下限 (~2km) 未満は描かない
-      legs.push({ a, b, dashed: isGapLeg(a, b), len });
+    // --- アーク (全チェーン分をひとつの Descriptor にまとめる) ---
+    interface Leg {
+      a: ChainNode;
+      b: ChainNode;
+      dashed: boolean;
+      len: number;
+      slot: number;
+    }
+    const legs: Leg[] = [];
+    for (const chain of chains) {
+      const { nodes, slot } = chain;
+      for (let i = 0; i + 1 < nodes.length; i++) {
+        const a = nodes[i];
+        const b = nodes[i + 1];
+        const len = haversine(a.lat, a.lng, b.lat, b.lng);
+        if (len < 2_500) continue; // ArcLine の精度下限 (~2km) 未満は描かない
+        legs.push({ a, b, dashed: isGapLeg(a, b), len, slot });
+      }
     }
     const shapeKey = legs
-      .map((l) => `${l.a.key}>${l.b.key}:${l.dashed ? "d" : "s"}`)
+      .map((l) => `${l.slot}:${l.a.key}>${l.b.key}:${l.dashed ? "d" : "s"}`)
       .join("|");
     if (shapeKey !== this.arcShapeKey) {
       this.arcShapeKey = shapeKey;
       this.arcs?.delete();
       this.arcs = null;
+      this.pulse?.delete();
+      this.pulse = null;
       this.arcCount = legs.length;
       if (legs.length > 0) {
         const configs = legs.map((l) => ({
@@ -289,8 +369,8 @@ export class Globe {
             { lng: l.a.lng, lat: l.a.lat },
             { lng: l.b.lng, lat: l.b.lat },
           ] satisfies LatLng[],
-          srcColor: new Color().setStyle(ARC_SRC),
-          tgtColor: new Color().setStyle(ARC_TGT),
+          srcColor: new Color().setStyle(TRACE_COLORS[l.slot].arcSrc),
+          tgtColor: new Color().setStyle(TRACE_COLORS[l.slot].arcTgt),
           thickness: l.dashed ? 1.2 : 1.7,
           segments: 96,
           arcHeightScale: 0.35,
@@ -304,97 +384,165 @@ export class Globe {
         }));
         this.arcs = this.view.addMesh<ArclineMeshDesc>({
           effectIds: [this.bloomId],
-          emissiveColor: new Color().setStyle(ARC_TGT),
           emissiveIntensity: 0.45,
           arcLines: configs,
         }) as unknown as DescHandle;
+
+        // パケットパルス: 実線区間の上を明るい短ダッシュが1つ流れる
+        const pulseLegs = legs.filter((l) => !l.dashed);
+        this.pulseCount = pulseLegs.length;
+        if (pulseLegs.length > 0) {
+          this.pulse = this.view.addMesh<ArclineMeshDesc>({
+            effectIds: [this.bloomId],
+            emissiveColor: new Color().setStyle("#ffffff"),
+            emissiveIntensity: 0.9,
+            arcLines: pulseLegs.map((l) => ({
+              geometry: [
+                { lng: l.a.lng, lat: l.a.lat },
+                { lng: l.b.lng, lat: l.b.lat },
+              ] satisfies LatLng[],
+              srcColor: new Color().setStyle("#ffffff"),
+              tgtColor: new Color().setStyle("#ffffff"),
+              thickness: 2.6,
+              segments: 96,
+              arcHeightScale: 0.35,
+              dashed: true,
+              dashSize: Math.max(l.len * 0.045, 1_500),
+              gapSize: l.len * 0.955,
+              dashOffset: this.pulseOffset,
+            })),
+          }) as unknown as DescHandle;
+        }
+      } else {
+        this.pulseCount = 0;
       }
     }
 
-    // --- ポイント ---
-    const wayFeatures = nodes
-      .filter((n) => !n.isDest)
-      .map((n) => pointFeature(n.lng, n.lat));
-    const destFeatures = nodes.filter((n) => n.isDest).map((n) => pointFeature(n.lng, n.lat));
-    this.pointSource?.update({ type: "geojson", data: fc(wayFeatures) });
-    this.destSource?.update({ type: "geojson", data: fc(destFeatures) });
+    // --- ポイント (スロット別) ---
+    const waysBySlot = new Map<number, ReturnType<typeof pointFeature>[]>();
+    const destsBySlot = new Map<number, ReturnType<typeof pointFeature>[]>();
+    for (const chain of chains) {
+      for (const n of chain.nodes) {
+        const bag = n.isDest ? destsBySlot : waysBySlot;
+        const list = bag.get(chain.slot) ?? [];
+        list.push(pointFeature(n.lng, n.lat));
+        bag.set(chain.slot, list);
+      }
+    }
+    for (let slot = 0; slot < TRACE_COLORS.length; slot++) {
+      this.waySources[slot]?.update({ type: "geojson", data: fc(waysBySlot.get(slot) ?? []) });
+      this.destSources[slot]?.update({ type: "geojson", data: fc(destsBySlot.get(slot) ?? []) });
+    }
 
     // --- チップ ---
-    const wanted = new Set(nodes.map((n) => n.key));
+    const wanted = new Map<string, { node: ChainNode; slot: number }>();
+    for (const chain of chains) {
+      for (const n of chain.nodes) {
+        wanted.set(`${chain.id}:${n.key}`, { node: n, slot: chain.slot });
+      }
+    }
     for (const [id, el] of this.chips) {
       if (!wanted.has(id)) {
         el.remove();
         this.chips.delete(id);
       }
     }
-    for (const node of nodes) {
-      let el = this.chips.get(node.key);
+    for (const [id, { node, slot }] of wanted) {
+      let el = this.chips.get(id);
       if (!el) {
         const btn = document.createElement("button");
         btn.type = "button";
         el = btn;
         el.className = "chip";
-        el.addEventListener("click", () => this.onNodeClick?.(node));
         this.chipRoot.appendChild(el);
-        this.chips.set(node.key, el);
+        this.chips.set(id, el);
       }
+      // ノードは更新のたびに作り直されるので、クリック時に最新を引けるよう毎回貼り替える
+      (el as HTMLButtonElement).onclick = () => this.onNodeClick?.(node);
       el.classList.toggle("chip-dest", node.isDest);
       el.classList.toggle("chip-origin", node.isOrigin);
+      for (let s = 0; s < TRACE_COLORS.length; s++) {
+        el.classList.toggle(`chip-slot-${s}`, s === slot);
+      }
+      // 複数トレースで同じ都市に重なったとき用に、スロットごとに縦へずらす
+      el.style.translate = `10px ${-26 - slot * 22}px`;
       const flag = flagEmoji(node.countryCode);
       el.textContent = `${nodeLabel(node)}${flag ? " " + flag : ""}`;
     }
-    this.overlay.setPositions(nodes.map((n) => ({ id: n.key, lng: n.lng, lat: n.lat, alt: 0 })));
+    this.overlay.setPositions(
+      [...wanted.entries()].map(([id, { node }]) => ({
+        id,
+        lng: node.lng,
+        lat: node.lat,
+        alt: 0,
+      })),
+    );
   }
 
   reset(): void {
-    this.setChain([]);
+    this.setChains([]);
+  }
+
+  /** 非表示タブでは rAF が止まりアニメーションが進まないので即時ジャンプにする */
+  private flyDuration(ms: number): number {
+    return document.visibilityState === "hidden" ? 0 : ms;
   }
 
   async flyToNode(node: ChainNode, distance = 2_200_000): Promise<void> {
+    if (!this.ready) return;
     await this.view.flyTo(
       { lng: node.lng, lat: node.lat, distance, heading: 0, pitch: -68, roll: 0 },
-      { duration: 1600 },
+      { duration: this.flyDuration(1600) },
     );
   }
 
-  /** 新しいホップに追従: 直前の区間が見える距離でフライ */
-  followLatest(): void {
-    const n = this.nodes.length;
+  /** 指定チェーンの最新ホップに追従: 直前の区間が見える距離でフライ */
+  followLatest(chainId: string): void {
+    if (!this.ready) return;
+    const nodes = this.chains.find((c) => c.id === chainId)?.nodes ?? [];
+    const n = nodes.length;
     if (n === 0) return;
-    const node = this.nodes[n - 1];
+    const node = nodes[n - 1];
     let distance = 1_800_000;
     if (n >= 2) {
-      const prev = this.nodes[n - 2];
-      distance = Math.min(Math.max(haversine(prev.lat, prev.lng, node.lat, node.lng) * 1.9, 900_000), 11_000_000);
+      const prev = nodes[n - 2];
+      // 下限はグロー殻 (半径1.08倍 ≈ 高度510km) に入り込まない距離にする
+      distance = Math.min(
+        Math.max(haversine(prev.lat, prev.lng, node.lat, node.lng) * 1.9, 1_400_000),
+        11_000_000,
+      );
     }
     void this.view.flyTo(
       { lng: node.lng, lat: node.lat, distance, heading: 0, pitch: -75, roll: 0 },
-      { duration: 1400 },
+      { duration: this.flyDuration(1400) },
     );
   }
 
-  /** 経路全体が収まるように俯瞰 */
+  /** 表示中の全経路が収まるように俯瞰 */
   fitAll(): void {
-    if (this.nodes.length === 0) return;
-    if (this.nodes.length === 1) {
-      void this.flyToNode(this.nodes[0]);
+    if (!this.ready) return;
+    const nodes = this.chains.flatMap((c) => c.nodes);
+    if (nodes.length === 0) return;
+    if (nodes.length === 1) {
+      void this.flyToNode(nodes[0]);
       return;
     }
-    const ref = this.nodes[0].lng;
+    const ref = nodes[0].lng;
     const norm = (lng: number) => ref + ((((lng - ref + 540) % 360) + 360) % 360) - 180;
-    const lats = this.nodes.map((n) => n.lat);
-    const lngs = this.nodes.map((n) => norm(n.lng));
+    const lats = nodes.map((n) => n.lat);
+    const lngs = nodes.map((n) => norm(n.lng));
     let cLat = lats.reduce((s, v) => s + v, 0) / lats.length;
     let cLng = lngs.reduce((s, v) => s + v, 0) / lngs.length;
     cLng = ((((cLng + 540) % 360) + 360) % 360) - 180;
     let maxDist = 0;
-    for (const n of this.nodes) {
+    for (const n of nodes) {
       maxDist = Math.max(maxDist, haversine(cLat, cLng, n.lat, n.lng));
     }
-    const height = Math.min(Math.max(maxDist * 2.4, 900_000), 22_000_000);
+    // 下限はグロー殻 (高度510km) より十分外側に取る
+    const height = Math.min(Math.max(maxDist * 2.4, 1_600_000), 22_000_000);
     void this.view.flyTo(
       { lng: cLng, lat: cLat, height, heading: 0, pitch: -90, roll: 0 },
-      { duration: 1800 },
+      { duration: this.flyDuration(1800) },
     );
   }
 
@@ -402,6 +550,19 @@ export class Globe {
   onUserGrab(fn: () => void): void {
     this.view.canvas.addEventListener("pointerdown", fn);
   }
+}
+
+function waitForSize(el: HTMLElement): Promise<void> {
+  if (el.offsetWidth > 0 && el.offsetHeight > 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const ro = new ResizeObserver(() => {
+      if (el.offsetWidth > 0 && el.offsetHeight > 0) {
+        ro.disconnect();
+        resolve();
+      }
+    });
+    ro.observe(el);
+  });
 }
 
 function pointFeature(lng: number, lat: number) {
