@@ -18,9 +18,16 @@ export interface GeoInfo {
   org?: string;
   as?: string;
   message?: string;
+  /** 位置の出どころ。ipmap = RIPE IPmap (遅延実測・逆引き等)、ip-api = 一般IPデータベース */
+  source?: "ipmap" | "ip-api";
+  geoScore?: number;
+  geoEngines?: string[];
 }
 
+/** ip-api + IPmap を合成した最終結果 */
 const geoCache = new Map<string, GeoInfo>();
+/** ip-api 単体の結果 (AS 情報の供給源) */
+const ipApiCache = new Map<string, GeoInfo>();
 
 function isPrivateIp(ip: string): boolean {
   if (ip.includes(":")) {
@@ -57,14 +64,9 @@ let pendingIps = new Map<string, Array<(g: GeoInfo) => void>>();
 let batchTimer: ReturnType<typeof setTimeout> | null = null;
 let lastBatchAt = 0;
 
-function lookupGeo(ip: string): Promise<GeoInfo> {
-  const cached = geoCache.get(ip);
+function lookupIpApi(ip: string): Promise<GeoInfo> {
+  const cached = ipApiCache.get(ip);
   if (cached) return Promise.resolve(cached);
-  if (isPrivateIp(ip)) {
-    const g: GeoInfo = { status: "private" };
-    geoCache.set(ip, g);
-    return Promise.resolve(g);
-  }
   return new Promise((resolve) => {
     const list = pendingIps.get(ip) ?? [];
     list.push(resolve);
@@ -121,9 +123,121 @@ async function flushGeoBatch() {
   for (const [ip, resolvers] of batch) {
     const g = results.get(ip) ?? { status: "fail" as const, message: "no result" };
     // 失敗はキャッシュしない(あとで再試行できるように)
-    if (g.status !== "fail") geoCache.set(ip, g);
+    if (g.status !== "fail") ipApiCache.set(ip, g);
     for (const r of resolvers) r(g);
   }
+}
+
+// ---------------------------------------------------------------------------
+// RIPE IPmap: RIPE Atlas の遅延実測・逆引きホスト名・geofeed 等を組み合わせた
+// ルータ向けの位置推定。一般向けIPデータベース (ip-api) はバックボーンの
+// ルータを大きく外すことがあるので、IPmap に「worlds (人口ベースの当て推量)」
+// 以外の根拠がある場合はそちらを採用する
+// ---------------------------------------------------------------------------
+
+interface IpmapLocation {
+  lat: number;
+  lon: number;
+  city?: string;
+  country?: string;
+  countryCode?: string;
+  score: number;
+  engines: string[];
+  /** worlds 以外のエンジン (latency / crowdsourced / geofeed など) の根拠があるか */
+  strong: boolean;
+}
+
+const ipmapCache = new Map<string, IpmapLocation | null>();
+const IPMAP_MAX_INFLIGHT = 4;
+let ipmapInflight = 0;
+const ipmapWaiters: Array<() => void> = [];
+
+async function withIpmapSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (ipmapInflight >= IPMAP_MAX_INFLIGHT) {
+    await new Promise<void>((r) => ipmapWaiters.push(r));
+  }
+  ipmapInflight++;
+  try {
+    return await fn();
+  } finally {
+    ipmapInflight--;
+    ipmapWaiters.shift()?.();
+  }
+}
+
+async function lookupIpmap(ip: string): Promise<IpmapLocation | null> {
+  const cached = ipmapCache.get(ip);
+  if (cached !== undefined) return cached;
+  return withIpmapSlot(async () => {
+    try {
+      const res = await fetch(
+        `https://ipmap-api.ripe.net/v1/locate/${encodeURIComponent(ip)}/best`,
+        { signal: AbortSignal.timeout(8_000) },
+      );
+      if (!res.ok) throw new Error(`ipmap HTTP ${res.status}`);
+      const j = (await res.json()) as {
+        location?: Record<string, unknown> | null;
+        score?: number;
+        geofeed?: string;
+      };
+      const loc = j.location;
+      if (!loc || typeof loc.latitude !== "number" || typeof loc.longitude !== "number") {
+        ipmapCache.set(ip, null);
+        return null;
+      }
+      const contributions = (loc.contributions ?? {}) as Record<string, unknown>;
+      const engines = Object.keys(contributions);
+      const r: IpmapLocation = {
+        lat: loc.latitude,
+        lon: loc.longitude as number,
+        city: (loc.cityName as string) || undefined,
+        country: (loc.countryName as string) || undefined,
+        countryCode: (loc.countryCodeAlpha2 as string) || undefined,
+        score: Number(loc.score ?? j.score ?? 0),
+        engines,
+        strong: engines.some((e) => e !== "worlds") || Boolean(j.geofeed),
+      };
+      ipmapCache.set(ip, r);
+      return r;
+    } catch {
+      return null; // 一時的な失敗はキャッシュしない
+    }
+  });
+}
+
+/** ip-api (ASN・ISP) と IPmap (位置) を合成する */
+async function lookupGeo(ip: string): Promise<GeoInfo> {
+  const cached = geoCache.get(ip);
+  if (cached) return cached;
+  if (isPrivateIp(ip)) {
+    const g: GeoInfo = { status: "private" };
+    geoCache.set(ip, g);
+    return g;
+  }
+  const [base, ipmap] = await Promise.all([lookupIpApi(ip), lookupIpmap(ip)]);
+  let g: GeoInfo;
+  if (ipmap && (ipmap.strong || base.status !== "ok")) {
+    g = {
+      ...base,
+      status: "ok",
+      message: undefined,
+      lat: ipmap.lat,
+      lon: ipmap.lon,
+      city: ipmap.city ?? base.city,
+      country: ipmap.country ?? base.country,
+      countryCode: ipmap.countryCode ?? base.countryCode,
+      source: "ipmap",
+      geoScore: ipmap.score,
+      geoEngines: ipmap.engines,
+    };
+  } else if (base.status === "ok") {
+    g = { ...base, source: "ip-api" };
+  } else {
+    g = base;
+  }
+  // ip-api が失敗 (レート制限等) の間は合成結果をキャッシュせず、後の再取得で AS 情報を埋められるようにする
+  if (g.status !== "fail" && base.status !== "fail") geoCache.set(ip, g);
+  return g;
 }
 
 // ---------------------------------------------------------------------------

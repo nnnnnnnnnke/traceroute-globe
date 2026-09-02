@@ -267,10 +267,30 @@ function geoText(geo: GeoInfo | undefined): string {
   if (geo.status === "fail") return "位置情報なし";
   const place = [geo.city, geo.country].filter(Boolean).join(", ");
   const asn = geo.as ? ` · ${geo.as.split(" ")[0]}` : "";
-  return `${flagEmoji(geo.countryCode)} ${place}${asn}`;
+  const src = geo.source === "ipmap" ? " · IPmap" : "";
+  return `${flagEmoji(geo.countryCode)} ${place}${asn}${src}`;
+}
+
+/**
+ * 光速制約による位置の検証: 往復 RTT が r ms なら発信元からの距離は
+ * 高々 約100km × r (光ファイバ中 ≈ 200,000km/s の往復)。それを大きく超える
+ * 推定位置は誤りとみなして地図から外す (一覧には ⚠ 付きで残す)
+ */
+function applyRttSanity(t: Trace): void {
+  const o = t.useOrigin && origin?.geo.status === "ok" ? origin.geo : null;
+  for (const hop of t.hops.values()) {
+    hop.geoSuspect = false;
+    if (!o || o.lat == null || o.lon == null) continue;
+    const g = hop.geo;
+    if (!g || g.status !== "ok" || g.lat == null || g.lon == null || hop.rtt == null) continue;
+    const dist = haversine(o.lat, o.lon, g.lat, g.lon);
+    const maxDist = hop.rtt * 100_000 * 1.15 + 50_000;
+    if (dist > maxDist) hop.geoSuspect = true;
+  }
 }
 
 function chainOf(t: Trace): ChainNode[] {
+  applyRttSanity(t);
   return buildChain(sortedHops(t), t.useOrigin ? origin : null, t.targetIp);
 }
 
@@ -375,9 +395,16 @@ function buildHopRow(t: Trace, hop: Hop, cableCands?: CableCandidate[]): HTMLLIE
     const metaLine = document.createElement("div");
     metaLine.className = "hop-meta";
     const rtt = hop.rtt != null ? `${hop.rtt.toFixed(1)} ms` : "";
-    metaLine.textContent = [geoText(hop.ip ? hop.geo : { status: "fail" }), rtt]
+    metaLine.textContent = [
+      geoText(hop.ip ? hop.geo : { status: "fail" }),
+      rtt,
+      hop.geoSuspect ? "⚠ RTTと矛盾する位置 (地図から除外)" : "",
+    ]
       .filter(Boolean)
       .join(" · ");
+    if (hop.geo?.geoEngines?.length) {
+      metaLine.title = `IPmap engines: ${hop.geo.geoEngines.join(", ")} (score ${hop.geo.geoScore ?? "-"})`;
+    }
     main.append(ipLine, metaLine);
     if (cableCands && cableCands.length > 0) {
       // この行のホップへ至る区間が海底ケーブルを通ると推定される場合
@@ -399,7 +426,7 @@ function buildHopRow(t: Trace, hop: Hop, cableCands?: CableCandidate[]): HTMLLIE
       });
       main.append(hint);
     }
-    if (hop.geo?.status === "ok") {
+    if (hop.geo?.status === "ok" && !hop.geoSuspect) {
       li.classList.add("clickable");
       li.addEventListener("click", () => flyToHop(t, hop));
     } else {

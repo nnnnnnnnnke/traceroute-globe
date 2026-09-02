@@ -9,6 +9,10 @@ export interface GeoInfo {
   org?: string;
   as?: string;
   message?: string;
+  /** 位置の出どころ。ipmap = RIPE IPmap (遅延実測・逆引き等)、ip-api = 一般IPデータベース */
+  source?: "ipmap" | "ip-api";
+  geoScore?: number;
+  geoEngines?: string[];
 }
 
 export interface Hop {
@@ -18,6 +22,8 @@ export interface Hop {
   note?: string;
   hostname?: string | null;
   geo?: GeoInfo;
+  /** 推定位置が RTT (光速制約) と矛盾するため地図から除外している */
+  geoSuspect?: boolean;
 }
 
 export interface TraceMeta {

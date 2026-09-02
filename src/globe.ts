@@ -87,7 +87,7 @@ export function buildChain(
   }
   for (const hop of hops) {
     const g = hop.geo;
-    if (!g || g.status !== "ok" || g.lat == null || g.lon == null) continue;
+    if (!g || g.status !== "ok" || g.lat == null || g.lon == null || hop.geoSuspect) continue;
     const last = nodes[nodes.length - 1];
     if (last && haversine(last.lat, last.lng, g.lat, g.lon) < 5_000) {
       last.hops.push(hop);
