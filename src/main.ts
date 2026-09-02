@@ -9,6 +9,14 @@ import {
   type ChainNode,
   type OriginInfo,
 } from "./globe";
+import {
+  fetchCableDetail,
+  inferCables,
+  loadCables,
+  type CableCandidate,
+  type CableFeature,
+  type CableInfo,
+} from "./cables";
 import { parseTraceText } from "./parse";
 import { enrichIps, startTrace, type TraceHandle } from "./tracer";
 import type { GeoInfo, Hop, TraceRecord } from "./types";
@@ -51,6 +59,8 @@ const rdnsByIp = new Map<string, string>();
 let origin: OriginInfo | null = null;
 let follow = true;
 let uiMessage: string | null = null; // 一時的な操作エラー等の表示 (renderStatus が描画)
+let cables: CableInfo[] = []; // 海底ケーブル (読み込み後)
+const cableInferCache = new Map<string, CableCandidate[]>(); // 区間キー → 推定結果
 
 const globe = new Globe();
 if (import.meta.env.DEV) {
@@ -260,6 +270,26 @@ function chainOf(t: Trace): ChainNode[] {
   return buildChain(sortedHops(t), t.useOrigin ? origin : null, t.targetIp);
 }
 
+/** 各区間の海底ケーブル推定。キーは区間の終点ノードの先頭ホップ TTL */
+function legCableCandidates(t: Trace): Map<number, CableCandidate[]> {
+  const map = new Map<number, CableCandidate[]>();
+  if (cables.length === 0) return map;
+  const nodes = chainOf(t);
+  for (let i = 0; i + 1 < nodes.length; i++) {
+    const a = nodes[i];
+    const b = nodes[i + 1];
+    const key = `${a.key}>${b.key}`;
+    let cands = cableInferCache.get(key);
+    if (!cands) {
+      cands = inferCables(a, b, cables);
+      cableInferCache.set(key, cands);
+    }
+    const firstHop = b.hops[0];
+    if (cands.length > 0 && firstHop) map.set(firstHop.ttl, cands);
+  }
+  return map;
+}
+
 /** 距離と光ファイバ理論RTTの統計行 */
 function statsText(t: Trace, nodes: ChainNode[]): string {
   const dist = chainDistance(nodes);
@@ -281,7 +311,7 @@ function statsText(t: Trace, nodes: ChainNode[]): string {
   return parts.join(" · ");
 }
 
-function buildHopRow(t: Trace, hop: Hop): HTMLLIElement {
+function buildHopRow(t: Trace, hop: Hop, cableCands?: CableCandidate[]): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "hop";
   const ttl = document.createElement("span");
@@ -309,6 +339,26 @@ function buildHopRow(t: Trace, hop: Hop): HTMLLIElement {
       .filter(Boolean)
       .join(" · ");
     main.append(ipLine, metaLine);
+    if (cableCands && cableCands.length > 0) {
+      // この行のホップへ至る区間が海底ケーブルを通ると推定される場合
+      const hint = document.createElement("div");
+      hint.className = "cable-hint";
+      hint.append("🌊 海底ケーブル (推定)");
+      cableCands.forEach((c, i) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "cable-name" + (i === 0 ? " best" : "");
+        b.textContent = c.cable.name;
+        b.title = `着陸点までの距離: ${Math.round(c.landingA / 1000)} km / ${Math.round(c.landingB / 1000)} km`;
+        b.addEventListener("click", (e) => {
+          e.stopPropagation();
+          globe.setCableHighlights(c.cable.features);
+          globe.flyToCable(c.cable);
+        });
+        hint.append(b);
+      });
+      main.append(hint);
+    }
     if (hop.geo?.status === "ok") {
       li.classList.add("clickable");
       li.addEventListener("click", () => flyToHop(t, hop));
@@ -371,7 +421,8 @@ function renderHopPanel() {
 
     const ol = document.createElement("ol");
     ol.className = "hop-list";
-    for (const hop of sortedHops(t)) ol.append(buildHopRow(t, hop));
+    const cands = legCableCandidates(t);
+    for (const hop of sortedHops(t)) ol.append(buildHopRow(t, hop, cands.get(hop.ttl)));
     sec.append(ol);
     hopSections.append(sec);
   }
@@ -559,6 +610,19 @@ function currentChains(): ChainLayer[] {
 function updateGlobe(followId?: string) {
   const chains = currentChains();
   globe.setChains(chains);
+  // 各区間の最有力ケーブルを発光表示
+  const hi: CableFeature[] = [];
+  const seen = new Set<string>();
+  for (const t of traces.values()) {
+    for (const list of legCableCandidates(t).values()) {
+      const best = list[0];
+      if (best && !seen.has(best.cable.id)) {
+        seen.add(best.cable.id);
+        hi.push(...best.cable.features);
+      }
+    }
+  }
+  globe.setCableHighlights(hi);
   const runningCount = [...traces.values()].filter((t) => t.status === "running").length;
   for (const t of traces.values()) {
     const len = chains.find((c) => c.id === t.id)?.nodes.length ?? 0;
@@ -858,6 +922,35 @@ async function boot() {
   runButton.disabled = false;
   visualizeButton.disabled = false;
   runButton.textContent = runLabel;
+
+  // 海底ケーブル: 表示トグル + データ読み込み (失敗しても本体は動く)
+  const cablesToggle = $<HTMLInputElement>("#cables-toggle");
+  const cablesStatus = $("#cables-status");
+  cablesToggle.addEventListener("change", () => globe.setCablesVisible(cablesToggle.checked));
+  globe.setCableClickHandler((id) => {
+    void fetchCableDetail(id)
+      .then((d) => {
+        const parts = [`🌊 ${d.name}`];
+        if (d.length) parts.push(d.length);
+        if (d.rfs) parts.push(`RFS ${d.rfs}`);
+        if (d.owners) parts.push(d.owners.length > 48 ? d.owners.slice(0, 47) + "…" : d.owners);
+        globe.setCableChipText(parts.join(" · "));
+      })
+      .catch(() => {});
+  });
+  void loadCables()
+    .then(({ geojson, cables: list }) => {
+      cables = list;
+      cableInferCache.clear();
+      globe.setCables(geojson);
+      cablesStatus.textContent = `${list.length} 本`;
+      renderAll();
+      updateGlobe();
+    })
+    .catch((e: unknown) => {
+      cablesStatus.textContent = "取得できませんでした";
+      console.warn("submarine cables:", e);
+    });
   globe.setNodeClickHandler((node) => void globe.flyToNode(node));
   globe.onUserGrab(() => {
     if (!follow) return;

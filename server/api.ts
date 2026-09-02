@@ -331,6 +331,57 @@ async function handleSelf(_req: IncomingMessage, res: ServerResponse) {
 }
 
 // ---------------------------------------------------------------------------
+// 海底ケーブルデータ (TeleGeography Submarine Cable Map) のプロキシ
+// ブラウザから直接は CORS で取れないため、サーバ側で取得してキャッシュする
+// ---------------------------------------------------------------------------
+
+const CABLE_API = "https://www.submarinecablemap.com/api/v3";
+const cableCache = new Map<string, { at: number; body: string }>();
+const CABLE_TTL_MS = 24 * 60 * 60 * 1000;
+
+async function proxyCableJson(path: string, res: ServerResponse) {
+  const cached = cableCache.get(path);
+  if (cached && Date.now() - cached.at < CABLE_TTL_MS) {
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "max-age=3600" });
+    res.end(cached.body);
+    return;
+  }
+  try {
+    const r = await fetch(`${CABLE_API}/${path}`);
+    if (!r.ok) throw new Error(`upstream HTTP ${r.status}`);
+    const body = await r.text();
+    cableCache.set(path, { at: Date.now(), body });
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "max-age=3600" });
+    res.end(body);
+  } catch (e) {
+    // 取得失敗時は期限切れキャッシュがあればそれを返す
+    if (cached) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(cached.body);
+      return;
+    }
+    res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+  }
+}
+
+const CABLE_ID_RE = /^[a-z0-9-]{1,80}$/;
+
+function handleCables(req: IncomingMessage, res: ServerResponse): boolean {
+  const path = (req.url ?? "").split("?")[0];
+  if (path === "/api/cables") {
+    void proxyCableJson("cable/cable-geo.json", res);
+    return true;
+  }
+  const m = path.match(/^\/api\/cables\/([^/]+)$/);
+  if (m && CABLE_ID_RE.test(m[1])) {
+    void proxyCableJson(`cable/${m[1]}.json`, res);
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Vite プラグイン
 // ---------------------------------------------------------------------------
 
@@ -343,6 +394,7 @@ export function tracerouteApi(): Plugin {
         if (path === "/api/trace" && req.method === "GET") return handleTrace(req, res);
         if (path === "/api/enrich" && req.method === "POST") return void handleEnrich(req, res);
         if (path === "/api/self" && req.method === "GET") return void handleSelf(req, res);
+        if (req.method === "GET" && handleCables(req, res)) return;
         next();
       });
     },

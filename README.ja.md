@@ -27,9 +27,16 @@ traceroute の経路を、[Navara](https://navara.world/)(Rust/WASM + Three.js �
   (英語・日本語) / `mtr --report` の出力をそのまま貼り付けて可視化
 - **履歴オーバーレイ** — 完了したトレースを localStorage に保存 (最大20件)。
   クリックで最大 4 本まで色分けして重ね描き
+- **海底ケーブル** — 世界中の海底ケーブル (TeleGeography のデータ、約700
+  システム) を経路の下に描画。ケーブルをクリックすると名前・長さ・RFS 年・
+  所有者を表示
+- **どのケーブルを通っているか** — 大陸間の区間ごとに、通っている可能性の
+  高いケーブルを推定 (両端ホップの近くに着陸点を持ち、その区間を跨ぐ
+  ケーブル)。ホップ一覧に候補を列挙し、最有力のものを地球儀上で発光表示。
+  traceroute では物理層は分からないので、あくまで「推定」として表示します
 - **ズーム対応** — 俯瞰は NASA Black Marble、寄ると OSM ベースの詳細ダーク
-  マップ (ストリートレベル) へ高度連動でクロスフェード。地表トラックと
-  ホップマーカーが正確に接続された状態で見えます
+  マップ (ストリートレベル) へ高度連動でクロスフェード。経路はタイルと同じ
+  パイプラインで地表に描くので、どのズームでも線とマーカーが正確に繋がります
 
 ![サンフランシスコ・ベイエリアへズームイン — San Jose / Palo Alto のホップが地表トラックでストリートレベルまで正確に接続](docs/screenshot-detail.png)
 
@@ -53,12 +60,12 @@ Vite が表示する URL (例: http://localhost:5173) を開く。
 
 | 要素 | 意味 |
 | --- | --- |
-| 実線アーク | TTL が連続しているホップ間の区間 |
-| 破線アーク | 位置不明ホップ (`*` タイムアウト、プライベート/CGN) を跨いだ区間 |
-| 細い地表線 | 大円に沿った正確なグラウンドトラック (ズームインするとアークから引き継ぐ) |
+| 実線 | TTL が連続しているホップ間の区間 (大円に沿った地表トラック) |
+| 破線 | 位置不明ホップ (`*` タイムアウト、プライベート/CGN) を跨いだ区間 |
 | 色 | トレースごとの色スロット: シアン → オレンジ → バイオレット → グリーン |
 | 大きい点 | 宛先 |
-| 白いパルス | 実線区間を流れる演出用のパケットパルス |
+| 青い細線の網 | 世界の海底ケーブル (左パネルのトグルで表示/非表示) |
+| 発光する青緑のケーブル | 大陸間区間で推定されたケーブル (ホップ一覧の `🌊`) |
 
 近接ホップ (5km 未満) は 1 地点にまとめ、`8–9 Chiyoda City` のように TTL
 範囲で表示します。右パネルには全ホップ (IP / 逆引き / 都市 / ASN / RTT) が
@@ -71,16 +78,23 @@ Vite が表示する URL (例: http://localhost:5173) を開く。
 ブラウザ (Vite + TypeScript + @navaramap/three)
   ├─ GET /api/trace    traceroute を spawn し、ホップ+ジオ+逆引きを SSE 配信
   ├─ POST /api/enrich  貼り付けモード用の一括ジオロケーション+逆引き
-  └─ GET /api/self     発信元 (自分のグローバル IP) の位置
+  ├─ GET /api/self     発信元 (自分のグローバル IP) の位置
+  └─ GET /api/cables   TeleGeography のケーブル GeoJSON / 詳細のプロキシ+キャッシュ
 サーバ側 (server/api.ts, Vite 開発サーバのミドルウェア)
   └─ ジオロケーションは ip-api.com /batch (15req/分制限に合わせて
      スロットル+マイクロバッチ+キャッシュ)
 ```
 
 Navara 側は、高度連動でクロスフェードする Black Marble + OSM ダークスタイル、
-selective bloom 付き `ArclineMeshDesc` のアーク、clampToGround の GeoJSON
-トラック/ポイント、`OverlayPlugin` で毎フレーム投影する DOM チップ (カメラ
-高度から地平線距離を計算して裏側は非表示) という構成です。
+clampToGround の GeoJSON ポリラインによる経路とケーブル (経路と推定ケーブル
+には selective bloom)、GeoJSON ポイントのホップ、`OverlayPlugin` で毎フレーム
+投影する DOM チップ (カメラ高度から地平線距離を計算して裏側は非表示) という
+構成です。
+
+ケーブル推定 (`src/cables.ts`): 600km 以上かつ国境を跨ぐ (国内なら 1,500km
+以上) 区間を対象に、両端のホップからそれぞれ 350km 以内に線の端点 (着陸点) を
+持ち、その 2 端点が区間を跨ぐだけ離れているケーブルを候補とし、着陸点までの
+距離と区間長との差で順位付けします。
 
 ローカルツールです。開発サーバはページから要求されたホストに対して
 `traceroute` を実行するので、localhost の外に公開しないでください。
@@ -90,10 +104,9 @@ selective bloom 付き `ArclineMeshDesc` のアーク、clampToGround の GeoJSO
 - ip-api.com の無料枠は非商用限定・HTTP のみ (サーバ側から呼び出し)・レート
   制限あり。制限は考慮済みですが、多用すると一時的に「位置情報なし」に
   なることがあります
-- アークはワールド座標で描画されるため、ストリートレベルまで寄るとベース
-  マップと数 km ずれることがあります (上流 ArcLine の精度特性)。そのため
-  高度約 400km 以下ではアークをフェードアウトし、正確な地表トラックに
-  引き継ぎます
+- 海底ケーブルのデータは TeleGeography の Submarine Cable Map 公開 API から
+  実行時に取得します (このリポジトリには同梱しません)。開発サーバが 24 時間
+  キャッシュし、クレジットは地図のアトリビューションに表示します
 - `docs/screenshot-*.png` は `node scripts/capture-screenshots.mjs` で再生成
   できます (Chrome と起動中の開発サーバが必要)
 
@@ -104,6 +117,7 @@ selective bloom 付き `ArclineMeshDesc` のアーク、clampToGround の GeoJSO
   Earth Observatory "Earth at Night 2016" (パブリックドメイン) と OSM ベースの
   ダークスタイル (© OpenStreetMap contributors)
 - IP ジオロケーション: [ip-api.com](https://ip-api.com)
+- 海底ケーブルの経路と詳細: [TeleGeography Submarine Cable Map](https://www.submarinecablemap.com/)
 
 ## ライセンス
 

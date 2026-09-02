@@ -1,10 +1,10 @@
-import ThreeView, { Color, type LatLng } from "@navaramap/three";
+import ThreeView, { Color, vector3ToGeodetic } from "@navaramap/three";
 import type {
-  ArclineMeshDesc,
   CylinderMeshDesc,
   GlowGlobeMeshDesc,
   SelectiveBloomEffectDesc,
 } from "@navaramap/three-default-descs";
+import { Vector3 } from "three";
 import {
   DefaultPlugin,
   type DefaultDescriptions,
@@ -142,6 +142,7 @@ export function greatCirclePoints(
   a: { lat: number; lng: number },
   b: { lat: number; lng: number },
   lenMeters: number,
+  samples?: number,
 ): [number, number][] {
   const rad = Math.PI / 180;
   const deg = 180 / Math.PI;
@@ -154,7 +155,7 @@ export function greatCirclePoints(
   const vb = toVec(b.lat, b.lng);
   const dot = Math.min(1, Math.max(-1, va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]));
   const omega = Math.acos(dot);
-  const n = Math.min(128, Math.max(2, Math.round(lenMeters / 50_000)));
+  const n = samples ?? Math.min(128, Math.max(2, Math.round(lenMeters / 50_000)));
   const points: [number, number][] = [];
   for (let i = 0; i <= n; i++) {
     const t = i / n;
@@ -172,6 +173,33 @@ export function greatCirclePoints(
     points.push([Math.atan2(y, x) * deg, Math.asin(z / Math.hypot(x, y, z)) * deg]);
   }
   return points;
+}
+
+/** 破線風の地表トラック: 大円を細かくサンプリングし、ダッシュ部分だけを線分列にする */
+function dashedTrackParts(
+  a: { lat: number; lng: number },
+  b: { lat: number; lng: number },
+  lenMeters: number,
+): [number, number][][] {
+  const dash = Math.min(Math.max(lenMeters / 25, 20_000), 120_000);
+  const gap = dash / 2;
+  const step = Math.max(2_000, Math.min(dash / 4, 10_000));
+  const n = Math.min(4_000, Math.ceil(lenMeters / step));
+  const pts = greatCirclePoints(a, b, lenMeters, n);
+  const segLen = lenMeters / n;
+  const parts: [number, number][][] = [];
+  let cur: [number, number][] | null = null;
+  for (let i = 0; i < pts.length; i++) {
+    const on = (i * segLen) % (dash + gap) < dash;
+    if (on) {
+      (cur ??= []).push(pts[i]);
+    } else if (cur) {
+      if (cur.length >= 2) parts.push(cur);
+      cur = null;
+    }
+  }
+  if (cur && cur.length >= 2) parts.push(cur);
+  return parts;
 }
 
 export function flagEmoji(countryCode?: string): string {
@@ -198,37 +226,42 @@ export const MAX_TRACES = TRACE_COLORS.length;
 // Globe 本体
 // ---------------------------------------------------------------------------
 
-interface DescHandle {
-  update(u: object): void;
-  delete(): void;
-}
-
 interface SourceHandle {
   update(u: object): void;
 }
+
+interface LayerHandle {
+  id: string;
+  update(u: object): void;
+}
+
+const CABLE_COLOR = "#2b5f8a";
+const CABLE_HI_COLOR = "#7ff3e6";
 
 export class Globe {
   private view!: ThreeView<DefaultDescriptions>;
   private overlay!: OverlayPlugin;
   private bloomId!: string;
-  private arcs: DescHandle | null = null;
-  private arcShapeKey = "";
-  private pulse: DescHandle | null = null;
-  private animTick = 0;
-  /** 区間ごとの dashOffset 前進量 (m/フレーム)。周期に比例させてストロボ化を防ぐ */
-  private arcSteps: number[] = [];
-  private pulseSteps: number[] = [];
+  private trackShapeKey = "";
   private waySources: SourceHandle[] = [];
   private destSources: SourceHandle[] = [];
   private trackSources: SourceHandle[] = [];
+  private gapSources: SourceHandle[] = [];
+  private cableSource: SourceHandle | null = null;
+  private cableLayer: LayerHandle | null = null;
+  private cableHiSource: SourceHandle | null = null;
+  private cablesVisible = true;
+  private cableChip: HTMLElement | null = null;
+  private cableChipPos: { lat: number; lng: number } | null = null;
+  private pickedCable: { id: string; name: string } | null = null;
+  private onCableClick: ((id: string, name: string) => void) | null = null;
+  private chipPositions: { id: string; lng: number; lat: number; alt: number }[] = [];
   private chipRoot!: HTMLElement;
   private chips = new Map<string, HTMLElement>();
   private chains: ChainLayer[] = [];
   private onNodeClick: ((node: ChainNode) => void) | null = null;
   private ready = false;
   private pendingChains: ChainLayer[] | null = null;
-  /** アーク/パルスの不透明度。近距離ではズレが見えるためフェードアウトする */
-  private flightOpacity = 1;
 
   async init(container: HTMLElement, chipRoot: HTMLElement): Promise<void> {
     this.chipRoot = chipRoot;
@@ -319,9 +352,6 @@ export class Globe {
         lastGlowOp = glowOp;
         glow.update({ glowGlobe: { opacity: glowOp } });
       }
-      // アークはワールド座標描画のため近距離では地表と数kmずれて見える。
-      // 高度400km以下でフェードし、地表トラック+ドットに引き継ぐ
-      this.flightOpacity = Math.min(1, Math.max(0, (h - 130_000) / (400_000 - 130_000)));
     };
     view.camera.on("move", applyLod);
     applyLod();
@@ -348,23 +378,56 @@ export class Globe {
     });
     this.bloomId = bloom.id;
 
-    // 色スロットごとのホップ地点ポイント (経由地 + 宛先)。
-    // clampToGround + offsetDepth で、ズームインしても地表に埋まらないようにする
+    // 海底ケーブル (TeleGeography)。経路より下に描くため先に追加する。
+    // 全体は控えめな色、推定で経路が通る候補は別レイヤーで発光させる
+    const cableSource = view.addSource({ type: "geojson", data: emptyLineFC(), tiled: true });
+    this.cableSource = cableSource;
+    this.cableLayer = view.addLayer({
+      type: "vector",
+      source: cableSource,
+      polyline: { color: new Color().setStyle(CABLE_COLOR), width: 1, clampToGround: true },
+    });
+    const cableHiSource = view.addSource({ type: "geojson", data: emptyLineFC() });
+    this.cableHiSource = cableHiSource;
+    view.addLayer({
+      type: "vector",
+      source: cableHiSource,
+      polyline: {
+        color: new Color().setStyle(CABLE_HI_COLOR),
+        width: 2.5,
+        clampToGround: true,
+        effectIds: [this.bloomId],
+      },
+    });
+
+    // 色スロットごとの経路線 + ホップ地点ポイント (経由地 + 宛先)。
+    // 線はタイルと同じ描画パイプラインを通る clampToGround のポリラインなので、
+    // どのズームでも地点と正確に繋がる (ワールド座標のアークは近距離でずれる)
     for (const c of TRACE_COLORS) {
-      // 地表トラック: アーク (ワールド座標メッシュ) はズームインすると地点と
-      // 数kmずれて見えることがあるため、タイルと同じ描画パイプラインを通る
-      // clampToGround のポリラインで「正確に繋がった」線を地表に敷く
       const track = view.addSource({ type: "geojson", data: emptyLineFC() });
       view.addLayer({
         type: "vector",
         source: track,
         polyline: {
           color: new Color().setStyle(c.arcTgt),
-          width: 2,
+          width: 2.4,
           clampToGround: true,
+          effectIds: [this.bloomId],
         },
       });
       this.trackSources.push(track);
+      // 位置不明ホップを跨ぐ区間: 破線風 (ダッシュごとの線分列)、細く控えめに
+      const gap = view.addSource({ type: "geojson", data: emptyLineFC() });
+      view.addLayer({
+        type: "vector",
+        source: gap,
+        polyline: {
+          color: new Color().setStyle(c.arcSrc),
+          width: 1.5,
+          clampToGround: true,
+        },
+      });
+      this.gapSources.push(gap);
 
       const way = view.addSource({ type: "geojson", data: emptyFC() });
       view.addLayer({
@@ -400,29 +463,31 @@ export class Globe {
       this.destSources.push(dest);
     }
 
-    // アークの流線 + パケットパルスのアニメーション
-    view.on("preUpdate", () => {
-      this.animTick++;
-      if (this.arcs && this.arcSteps.length > 0) {
-        this.arcs.update({
-          // 不透明度だけでなくブルーム源 (emissive) も一緒に絞らないと、
-          // フェード後も発光の残光が残る
-          emissiveIntensity: 0.45 * this.flightOpacity,
-          arcLines: this.arcSteps.map((s) => ({
-            dashOffset: -this.animTick * s,
-            opacity: this.flightOpacity,
-          })),
-        });
+    // 海底ケーブルのクリック: featureClick で拾ったフィーチャを、続く click で
+    // 座標付きで確定する (ドラッグ終わりのクリックは無視)
+    view.on("featureClick", (info) => {
+      this.pickedCable =
+        info && info.layerId === this.cableLayer?.id && info.properties
+          ? { id: String(info.properties.id), name: String(info.properties.name) }
+          : null;
+    });
+    let downX = 0;
+    let downY = 0;
+    view.on("mousedown", (e) => {
+      downX = e.clientX;
+      downY = e.clientY;
+    });
+    view.on("click", (e) => {
+      if (Math.hypot(e.clientX - downX, e.clientY - downY) > 4) return;
+      const picked = this.pickedCable;
+      this.pickedCable = null;
+      if (!picked) {
+        this.hideCableChip();
+        return;
       }
-      if (this.pulse && this.pulseSteps.length > 0) {
-        this.pulse.update({
-          emissiveIntensity: 0.65 * this.flightOpacity,
-          arcLines: this.pulseSteps.map((s) => ({
-            dashOffset: -this.animTick * s,
-            opacity: this.flightOpacity,
-          })),
-        });
-      }
+      const { lat, lng } = vector3ToGeodetic(new Vector3(e.map.x, e.map.y, e.map.z));
+      this.showCableChip(`🌊 ${picked.name}`, { lat, lng });
+      this.onCableClick?.(picked.id, picked.name);
     });
 
     // DOMチップの毎フレーム再配置 (地平線の裏に回った地点は隠す)
@@ -444,11 +509,23 @@ export class Globe {
           el.style.display = "none";
         }
       }
+      if (this.cableChip) {
+        const pos = projected.get("cable-pick");
+        if (pos && pos.distance < horizon) {
+          this.cableChip.style.display = "";
+          moveOverlayElement(this.cableChip, pos.x, pos.y);
+        } else {
+          this.cableChip.style.display = "none";
+        }
+      }
     });
 
     view.attribution?.add([
       {
         attributionHtml: `IP Geolocation by <a href="https://ip-api.com">ip-api.com</a>`,
+      },
+      {
+        attributionHtml: `Submarine cables © <a href="https://www.submarinecablemap.com/">TeleGeography</a>`,
       },
     ]);
 
@@ -474,7 +551,7 @@ export class Globe {
       return;
     }
 
-    // --- アーク (全チェーン分をひとつの Descriptor にまとめる) ---
+    // --- 経路線 (地表トラック、スロット別。実線 / 破線風で分ける) ---
     interface Leg {
       a: ChainNode;
       b: ChainNode;
@@ -489,106 +566,37 @@ export class Globe {
         const a = nodes[i];
         const b = nodes[i + 1];
         const len = haversine(a.lat, a.lng, b.lat, b.lng);
-        if (len < 2_500) continue; // ArcLine の精度下限 (~2km) 未満は描かない
+        if (len < 500) continue;
         legs.push({ a, b, dashed: isGapLeg(a, b), len, slot });
       }
     }
     const shapeKey = legs
       .map((l) => `${l.slot}:${l.a.key}>${l.b.key}:${l.dashed ? "d" : "s"}`)
       .join("|");
-    if (shapeKey !== this.arcShapeKey) {
-      this.arcShapeKey = shapeKey;
-
-      // 地表トラック (スロット別) を更新
-      const trackBySlot = new Map<number, ReturnType<typeof lineFeature>[]>();
+    if (shapeKey !== this.trackShapeKey) {
+      this.trackShapeKey = shapeKey;
+      const solidBySlot = new Map<number, ReturnType<typeof lineFeature>[]>();
+      const gapBySlot = new Map<number, ReturnType<typeof lineFeature>[]>();
       for (const l of legs) {
-        const list = trackBySlot.get(l.slot) ?? [];
-        list.push(lineFeature(greatCirclePoints(l.a, l.b, l.len)));
-        trackBySlot.set(l.slot, list);
+        if (l.dashed) {
+          const list = gapBySlot.get(l.slot) ?? [];
+          for (const part of dashedTrackParts(l.a, l.b, l.len)) list.push(lineFeature(part));
+          gapBySlot.set(l.slot, list);
+        } else {
+          const list = solidBySlot.get(l.slot) ?? [];
+          list.push(lineFeature(greatCirclePoints(l.a, l.b, l.len)));
+          solidBySlot.set(l.slot, list);
+        }
       }
       for (let slot = 0; slot < TRACE_COLORS.length; slot++) {
         this.trackSources[slot]?.update({
           type: "geojson",
-          data: lineFC(trackBySlot.get(slot) ?? []),
+          data: lineFC(solidBySlot.get(slot) ?? []),
         });
-      }
-      this.arcs?.delete();
-      this.arcs = null;
-      this.pulse?.delete();
-      this.pulse = null;
-      this.arcSteps = [];
-      this.pulseSteps = [];
-      if (legs.length > 0) {
-        // ダッシュ模様はシェーダ側で「弧長」に沿って刻まれる。弧長は
-        // arcHeightScale 0.35 のとき測地距離の約1.30倍 (実装の円弧近似より)
-        const ARC_LEN_FACTOR = 1.3;
-        // セグメント数は区間長に応じて増やす (一律だと長距離アークの末端が
-        // ズームイン時に粗く折れて、地点に届いていないように見える)
-        const segmentsFor = (len: number) =>
-          Math.min(512, Math.max(48, Math.round(len / 25_000)));
-        // ダッシュは区間長比例 + 上限 (長距離区間で「空白」が数百kmになり、
-        // ズームインすると線が消えて見えるのを防ぐ)
-        const dashSizeFor = (len: number) => Math.min(Math.max(len / 14, 2_500), 120_000);
-        const configs = legs.map((l) => ({
-          geometry: [
-            { lng: l.a.lng, lat: l.a.lat },
-            { lng: l.b.lng, lat: l.b.lat },
-          ] satisfies LatLng[],
-          srcColor: new Color().setStyle(TRACE_COLORS[l.slot].arcSrc),
-          tgtColor: new Color().setStyle(TRACE_COLORS[l.slot].arcTgt),
-          thickness: l.dashed ? 1.2 : 1.7,
-          segments: segmentsFor(l.len),
-          arcHeightScale: 0.35,
-          gradation: 0.35,
-          transparent: true,
-          opacity: this.flightOpacity,
-          dashed: l.dashed,
-          dashSize: dashSizeFor(l.len),
-          gapSize: dashSizeFor(l.len) / 2,
-          dashOffset: 0,
-        }));
-        // 破線の行進速度は周期に比例 (3秒で1周期)。実線は例に倣った定速スイープ
-        this.arcSteps = legs.map((l) =>
-          l.dashed ? (dashSizeFor(l.len) * 1.5) / 180 : 4_000,
-        );
-        this.arcs = this.view.addMesh<ArclineMeshDesc>({
-          effectIds: [this.bloomId],
-          emissiveIntensity: 0.45,
-          arcLines: configs,
-        }) as unknown as DescHandle;
-
-        // パケットパルス: 実線区間の上を明るい短ダッシュがちょうど1つ、約4秒で流れる
-        const pulseLegs = legs.filter((l) => !l.dashed);
-        if (pulseLegs.length > 0) {
-          this.pulseSteps = pulseLegs.map((l) => (l.len * ARC_LEN_FACTOR) / 240);
-          this.pulse = this.view.addMesh<ArclineMeshDesc>({
-            effectIds: [this.bloomId],
-            emissiveColor: new Color().setStyle("#ffffff"),
-            emissiveIntensity: 0.65,
-            arcLines: pulseLegs.map((l) => {
-              const arcLen = l.len * ARC_LEN_FACTOR;
-              const dashSize = Math.max(arcLen * 0.05, 1_200);
-              return {
-                geometry: [
-                  { lng: l.a.lng, lat: l.a.lat },
-                  { lng: l.b.lng, lat: l.b.lat },
-                ] satisfies LatLng[],
-                srcColor: new Color().setStyle("#ffffff"),
-                tgtColor: new Color().setStyle("#ffffff"),
-                thickness: 2.1,
-                segments: segmentsFor(l.len),
-                arcHeightScale: 0.35,
-                transparent: true,
-                opacity: this.flightOpacity,
-                dashed: true,
-                dashSize,
-                // 周期 = 弧長ちょうどにして、常にパルスが1つだけ見えるようにする
-                gapSize: arcLen - dashSize,
-                dashOffset: 0,
-              };
-            }),
-          }) as unknown as DescHandle;
-        }
+        this.gapSources[slot]?.update({
+          type: "geojson",
+          data: lineFC(gapBySlot.get(slot) ?? []),
+        });
       }
     }
 
@@ -643,18 +651,90 @@ export class Globe {
       const flag = flagEmoji(node.countryCode);
       el.textContent = `${nodeLabel(node)}${flag ? " " + flag : ""}`;
     }
-    this.overlay.setPositions(
-      [...wanted.entries()].map(([id, { node }]) => ({
-        id,
-        lng: node.lng,
-        lat: node.lat,
-        alt: 0,
-      })),
-    );
+    this.chipPositions = [...wanted.entries()].map(([id, { node }]) => ({
+      id,
+      lng: node.lng,
+      lat: node.lat,
+      alt: 0,
+    }));
+    this.syncOverlay();
   }
 
   reset(): void {
     this.setChains([]);
+  }
+
+  private syncOverlay(): void {
+    const positions = [...this.chipPositions];
+    if (this.cableChipPos) {
+      positions.push({ id: "cable-pick", lng: this.cableChipPos.lng, lat: this.cableChipPos.lat, alt: 0 });
+    }
+    this.overlay.setPositions(positions);
+  }
+
+  // ---- 海底ケーブル ----
+
+  setCableClickHandler(fn: (id: string, name: string) => void): void {
+    this.onCableClick = fn;
+  }
+
+  /** TeleGeography の cable-geo.json (FeatureCollection) をそのまま渡す */
+  setCables(geojson: object): void {
+    this.cableSource?.update({ type: "geojson", data: geojson, tiled: true });
+  }
+
+  setCablesVisible(visible: boolean): void {
+    this.cablesVisible = visible;
+    this.cableLayer?.update({
+      type: "vector",
+      source: this.cableSource,
+      polyline: {
+        color: new Color().setStyle(CABLE_COLOR),
+        width: 1,
+        clampToGround: true,
+        show: this.cablesVisible,
+      },
+    });
+  }
+
+  /** 経路が通ると推定したケーブルのフィーチャを発光表示する */
+  setCableHighlights(features: object[]): void {
+    this.cableHiSource?.update({
+      type: "geojson",
+      data: { type: "FeatureCollection", features },
+    });
+  }
+
+  flyToCable(cable: { label: { lat: number; lng: number } }): void {
+    if (!this.ready) return;
+    void this.view.flyTo(
+      { lng: cable.label.lng, lat: cable.label.lat, height: 3_500_000, heading: 0, pitch: -90, roll: 0 },
+      { duration: this.flyDuration(1600) },
+    );
+  }
+
+  private showCableChip(text: string, pos: { lat: number; lng: number }): void {
+    if (!this.cableChip) {
+      const el = document.createElement("div");
+      el.className = "chip chip-cable";
+      this.chipRoot.appendChild(el);
+      this.cableChip = el;
+    }
+    this.cableChip.textContent = text;
+    this.cableChipPos = pos;
+    this.syncOverlay();
+  }
+
+  setCableChipText(text: string): void {
+    if (this.cableChip) this.cableChip.textContent = text;
+  }
+
+  hideCableChip(): void {
+    if (!this.cableChip) return;
+    this.cableChip.remove();
+    this.cableChip = null;
+    this.cableChipPos = null;
+    if (this.ready) this.syncOverlay();
   }
 
   /** 非表示タブでは rAF が止まりアニメーションが進まないので即時ジャンプにする */
