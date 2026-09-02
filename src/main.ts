@@ -5,11 +5,14 @@ import {
   buildChain,
   chainDistance,
   flagEmoji,
+  greatCirclePoints,
+  haversine,
   type ChainLayer,
   type ChainNode,
   type OriginInfo,
 } from "./globe";
 import {
+  cablePath,
   fetchCableDetail,
   inferCables,
   loadCables,
@@ -61,6 +64,7 @@ let follow = true;
 let uiMessage: string | null = null; // 一時的な操作エラー等の表示 (renderStatus が描画)
 let cables: CableInfo[] = []; // 海底ケーブル (読み込み後)
 const cableInferCache = new Map<string, CableCandidate[]>(); // 区間キー → 推定結果
+const legPathCache = new Map<string, [number, number][] | null>(); // 区間キー → ケーブル沿いの線形
 
 const globe = new Globe();
 if (import.meta.env.DEV) {
@@ -286,6 +290,42 @@ function legCableCandidates(t: Trace): Map<number, CableCandidate[]> {
     }
     const firstHop = b.hops[0];
     if (cands.length > 0 && firstHop) map.set(firstHop.ttl, cands);
+  }
+  return map;
+}
+
+/**
+ * 推定ケーブルがある区間の線形: ホップ → (大円) → 着陸点 → ケーブルの実際の
+ * 敷設ルート → 着陸点 → (大円) → ホップ。地表線をこの形で描く
+ */
+function legPathsFor(t: Trace): Map<string, [number, number][]> {
+  const map = new Map<string, [number, number][]>();
+  if (cables.length === 0) return map;
+  const nodes = chainOf(t);
+  for (let i = 0; i + 1 < nodes.length; i++) {
+    const a = nodes[i];
+    const b = nodes[i + 1];
+    const key = `${a.key}>${b.key}`;
+    let path = legPathCache.get(key);
+    if (path === undefined) {
+      path = null;
+      let cands = cableInferCache.get(key);
+      if (!cands) {
+        cands = inferCables(a, b, cables);
+        cableInferCache.set(key, cands);
+      }
+      const best = cands[0];
+      const core = best ? cablePath(best.cable, a, b) : null;
+      if (core) {
+        const start = { lng: core[0][0], lat: core[0][1] };
+        const end = { lng: core[core.length - 1][0], lat: core[core.length - 1][1] };
+        const lead = greatCirclePoints(a, start, haversine(a.lat, a.lng, start.lat, start.lng));
+        const tail = greatCirclePoints(end, b, haversine(end.lat, end.lng, b.lat, b.lng));
+        path = [...lead, ...core.slice(1), ...tail.slice(1)];
+      }
+      legPathCache.set(key, path);
+    }
+    if (path) map.set(key, path);
   }
   return map;
 }
@@ -604,7 +644,12 @@ function renderHistory() {
 // ---------------------------------------------------------------------------
 
 function currentChains(): ChainLayer[] {
-  return sortedTraces().map((t) => ({ id: t.id, slot: t.slot, nodes: chainOf(t) }));
+  return sortedTraces().map((t) => ({
+    id: t.id,
+    slot: t.slot,
+    nodes: chainOf(t),
+    legPaths: legPathsFor(t),
+  }));
 }
 
 function updateGlobe(followId?: string) {
@@ -942,6 +987,7 @@ async function boot() {
     .then(({ geojson, cables: list }) => {
       cables = list;
       cableInferCache.clear();
+      legPathCache.clear();
       globe.setCables(geojson);
       cablesStatus.textContent = `${list.length} 本`;
       renderAll();

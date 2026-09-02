@@ -45,6 +45,9 @@ export interface ChainLayer {
   id: string;
   slot: number; // TRACE_COLORS のインデックス
   nodes: ChainNode[];
+  /** 区間 (`${a.key}>${b.key}`) ごとの線形の上書き。海底ケーブルの実際の
+   *  敷設ルートに沿わせるときに使う。無い区間は大円で描く */
+  legPaths?: Map<string, [number, number][]>;
 }
 
 export function haversine(
@@ -175,22 +178,38 @@ export function greatCirclePoints(
   return points;
 }
 
-/** 破線風の地表トラック: 大円を細かくサンプリングし、ダッシュ部分だけを線分列にする */
-function dashedTrackParts(
-  a: { lat: number; lng: number },
-  b: { lat: number; lng: number },
+/** 折れ線を距離 step ごとに再サンプリングする (等間隔の点列にしてダッシュ化しやすくする) */
+function resamplePolyline(coords: [number, number][], step: number): [number, number][] {
+  const out: [number, number][] = [coords[0]];
+  let cum = 0;
+  let nextAt = step;
+  for (let i = 1; i < coords.length; i++) {
+    const a = coords[i - 1];
+    const b = coords[i];
+    const segLen = haversine(a[1], a[0], b[1], b[0]);
+    while (segLen > 0 && nextAt <= cum + segLen) {
+      const t = (nextAt - cum) / segLen;
+      out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+      nextAt += step;
+    }
+    cum += segLen;
+  }
+  out.push(coords[coords.length - 1]);
+  return out;
+}
+
+/** 等間隔の点列を、区間長に応じたダッシュ/ギャップで線分列に分割する */
+function chunkDashes(
+  pts: [number, number][],
+  step: number,
   lenMeters: number,
 ): [number, number][][] {
   const dash = Math.min(Math.max(lenMeters / 25, 20_000), 120_000);
   const gap = dash / 2;
-  const step = Math.max(2_000, Math.min(dash / 4, 10_000));
-  const n = Math.min(4_000, Math.ceil(lenMeters / step));
-  const pts = greatCirclePoints(a, b, lenMeters, n);
-  const segLen = lenMeters / n;
   const parts: [number, number][][] = [];
   let cur: [number, number][] | null = null;
   for (let i = 0; i < pts.length; i++) {
-    const on = (i * segLen) % (dash + gap) < dash;
+    const on = (i * step) % (dash + gap) < dash;
     if (on) {
       (cur ??= []).push(pts[i]);
     } else if (cur) {
@@ -200,6 +219,37 @@ function dashedTrackParts(
   }
   if (cur && cur.length >= 2) parts.push(cur);
   return parts;
+}
+
+function dashStepFor(lenMeters: number): number {
+  const dash = Math.min(Math.max(lenMeters / 25, 20_000), 120_000);
+  return Math.max(2_000, Math.min(dash / 4, 10_000));
+}
+
+/** 破線風の地表トラック: 大円を細かくサンプリングし、ダッシュ部分だけを線分列にする */
+function dashedTrackParts(
+  a: { lat: number; lng: number },
+  b: { lat: number; lng: number },
+  lenMeters: number,
+): [number, number][][] {
+  const step = dashStepFor(lenMeters);
+  const n = Math.min(4_000, Math.ceil(lenMeters / step));
+  return chunkDashes(greatCirclePoints(a, b, lenMeters, n), lenMeters / n, lenMeters);
+}
+
+/** 任意の折れ線 (ケーブル線形など) に沿った破線風トラック */
+function dashedAlongPath(path: [number, number][], lenMeters: number): [number, number][][] {
+  const step = dashStepFor(lenMeters);
+  return chunkDashes(resamplePolyline(path, step), step, lenMeters);
+}
+
+/** 折れ線の長さ (m) */
+export function pathLength(coords: [number, number][]): number {
+  let len = 0;
+  for (let i = 1; i < coords.length; i++) {
+    len += haversine(coords[i - 1][1], coords[i - 1][0], coords[i][1], coords[i][0]);
+  }
+  return len;
 }
 
 export function flagEmoji(countryCode?: string): string {
@@ -558,6 +608,8 @@ export class Globe {
       dashed: boolean;
       len: number;
       slot: number;
+      /** ケーブル線形などで上書きされた線形 (無ければ大円) */
+      path?: [number, number][];
     }
     const legs: Leg[] = [];
     for (const chain of chains) {
@@ -567,11 +619,12 @@ export class Globe {
         const b = nodes[i + 1];
         const len = haversine(a.lat, a.lng, b.lat, b.lng);
         if (len < 500) continue;
-        legs.push({ a, b, dashed: isGapLeg(a, b), len, slot });
+        const path = chain.legPaths?.get(`${a.key}>${b.key}`);
+        legs.push({ a, b, dashed: isGapLeg(a, b), len, slot, path });
       }
     }
     const shapeKey = legs
-      .map((l) => `${l.slot}:${l.a.key}>${l.b.key}:${l.dashed ? "d" : "s"}`)
+      .map((l) => `${l.slot}:${l.a.key}>${l.b.key}:${l.dashed ? "d" : "s"}${l.path ? "c" : "g"}`)
       .join("|");
     if (shapeKey !== this.trackShapeKey) {
       this.trackShapeKey = shapeKey;
@@ -580,11 +633,14 @@ export class Globe {
       for (const l of legs) {
         if (l.dashed) {
           const list = gapBySlot.get(l.slot) ?? [];
-          for (const part of dashedTrackParts(l.a, l.b, l.len)) list.push(lineFeature(part));
+          const parts = l.path
+            ? dashedAlongPath(l.path, pathLength(l.path))
+            : dashedTrackParts(l.a, l.b, l.len);
+          for (const part of parts) list.push(lineFeature(part));
           gapBySlot.set(l.slot, list);
         } else {
           const list = solidBySlot.get(l.slot) ?? [];
-          list.push(lineFeature(greatCirclePoints(l.a, l.b, l.len)));
+          list.push(lineFeature(l.path ?? greatCirclePoints(l.a, l.b, l.len)));
           solidBySlot.set(l.slot, list);
         }
       }

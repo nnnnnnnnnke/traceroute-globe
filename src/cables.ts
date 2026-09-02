@@ -80,6 +80,136 @@ export async function fetchCableDetail(id: string): Promise<CableDetail> {
   return (await res.json()) as CableDetail;
 }
 
+// ---------------------------------------------------------------------------
+// ケーブル線形に沿った経路: ケーブルのパーツ (LineString) を端点でつないだ
+// グラフとみなし、区間の両端に最も近い端点同士を最短経路で結ぶ
+// ---------------------------------------------------------------------------
+
+type LngLat = [number, number];
+
+interface CableGraph {
+  nodes: { lat: number; lng: number }[];
+  edges: { a: number; b: number; coords: LngLat[]; len: number }[];
+  adj: Map<number, number[]>;
+}
+
+const graphCache = new WeakMap<CableInfo, CableGraph>();
+
+function cableGraph(cable: CableInfo): CableGraph {
+  const cached = graphCache.get(cable);
+  if (cached) return cached;
+  const nodes: CableGraph["nodes"] = [];
+  const edges: CableGraph["edges"] = [];
+  const adj = new Map<number, number[]>();
+  const index = new Map<string, number>();
+  // 端点は約1kmで丸めて同一視する (分岐点で共有される座標のわずかな差を吸収)
+  const nodeFor = (c: LngLat) => {
+    const key = `${c[0].toFixed(2)},${c[1].toFixed(2)}`;
+    let i = index.get(key);
+    if (i === undefined) {
+      i = nodes.length;
+      nodes.push({ lng: c[0], lat: c[1] });
+      index.set(key, i);
+    }
+    return i;
+  };
+  for (const f of cable.features) {
+    for (const part of f.geometry.coordinates) {
+      if (part.length < 2) continue;
+      const a = nodeFor(part[0]);
+      const b = nodeFor(part[part.length - 1]);
+      let len = 0;
+      for (let i = 1; i < part.length; i++) {
+        len += haversine(part[i - 1][1], part[i - 1][0], part[i][1], part[i][0]);
+      }
+      const idx = edges.length;
+      edges.push({ a, b, coords: part, len });
+      (adj.get(a) ?? adj.set(a, []).get(a)!).push(idx);
+      (adj.get(b) ?? adj.set(b, []).get(b)!).push(idx);
+    }
+  }
+  const g = { nodes, edges, adj };
+  graphCache.set(cable, g);
+  return g;
+}
+
+/**
+ * ケーブル上で、from に最も近い端点から to に最も近い端点までの線形を返す。
+ * つながっていない (別系統のパーツ) 場合は null。
+ */
+export function cablePath(
+  cable: CableInfo,
+  from: { lat: number; lng: number },
+  to: { lat: number; lng: number },
+): LngLat[] | null {
+  const g = cableGraph(cable);
+  if (g.nodes.length < 2) return null;
+  let sA = -1;
+  let sB = -1;
+  let dA = Infinity;
+  let dB = Infinity;
+  g.nodes.forEach((n, i) => {
+    const da = haversine(from.lat, from.lng, n.lat, n.lng);
+    if (da < dA) {
+      dA = da;
+      sA = i;
+    }
+    const db = haversine(to.lat, to.lng, n.lat, n.lng);
+    if (db < dB) {
+      dB = db;
+      sB = i;
+    }
+  });
+  if (sA < 0 || sB < 0 || sA === sB) return null;
+
+  // Dijkstra (ノード数は多くても数百なので単純実装で十分)
+  const dist = new Array<number>(g.nodes.length).fill(Infinity);
+  const prevEdge = new Array<number>(g.nodes.length).fill(-1);
+  const done = new Array<boolean>(g.nodes.length).fill(false);
+  dist[sA] = 0;
+  for (;;) {
+    let u = -1;
+    let best = Infinity;
+    for (let i = 0; i < dist.length; i++) {
+      if (!done[i] && dist[i] < best) {
+        best = dist[i];
+        u = i;
+      }
+    }
+    if (u < 0 || u === sB) break;
+    done[u] = true;
+    for (const ei of g.adj.get(u) ?? []) {
+      const e = g.edges[ei];
+      const v = e.a === u ? e.b : e.a;
+      if (dist[u] + e.len < dist[v]) {
+        dist[v] = dist[u] + e.len;
+        prevEdge[v] = ei;
+      }
+    }
+  }
+  if (!Number.isFinite(dist[sB])) return null;
+
+  // 逆順にエッジを辿り、向きを揃えて座標列を連結
+  const chain: number[] = [];
+  for (let v = sB; v !== sA; ) {
+    const ei = prevEdge[v];
+    if (ei < 0) return null;
+    chain.push(ei);
+    const e = g.edges[ei];
+    v = e.a === v ? e.b : e.a;
+  }
+  chain.reverse();
+  const out: LngLat[] = [];
+  let cur = sA;
+  for (const ei of chain) {
+    const e = g.edges[ei];
+    const coords = e.a === cur ? e.coords : [...e.coords].reverse();
+    for (let i = out.length === 0 ? 0 : 1; i < coords.length; i++) out.push(coords[i]);
+    cur = e.a === cur ? e.b : e.a;
+  }
+  return out.length >= 2 ? out : null;
+}
+
 /** ホップの位置から着陸点までこの距離以内なら「その近くで陸揚げ」とみなす */
 const LANDING_RADIUS_M = 350_000;
 /** これより短い区間は海底ケーブル推定の対象外 (都市間の陸上伝送とみなす) */
