@@ -21,7 +21,7 @@ import {
 import { hostnameLocation } from "./hostname-geo";
 import { parseTraceText } from "./parse";
 import { enrichIps, startTrace, type TraceHandle } from "./tracer";
-import type { GeoInfo, Hop, TraceRecord } from "./types";
+import type { GeoCandidate, GeoInfo, Hop, TraceRecord } from "./types";
 
 const $ = <T extends HTMLElement>(sel: string): T => {
   const el = document.querySelector<T>(sel);
@@ -276,74 +276,103 @@ const KM_PER_MS = 100;
 const RTT_SLACK_MS = 15;
 
 /**
- * 位置候補 (IPmap / ip-api) を RTT の物理整合性で選び直す。
+ * 位置候補 (ホスト名 / IPmap / ip-api) を RTT の物理整合性で選び直す。
  * - 発信元が分かるライブトレース: 発信元からの距離 ≤ 100km × RTT
- * - それに加えて、RTT 差が最も小さい隣接ホップ (位置既知) との距離 ≤ 100km × (|ΔRTT| + 15)
+ * - RTT 差が最も小さい隣接ホップ (位置既知) との距離 ≤ 100km × (|ΔRTT| + 15)
+ * 隣接ホップの基準位置は、まず「他ソースと一致するホスト名候補 > サーバ一次候補」で
+ * 仮決めし、以降は前の反復で RTT 検証を通った位置に置き換えて 2 回反復する
+ * (ホスト名の誤検出 1 件が無検証のまま隣まで壊す連鎖を防ぐ)。
  * どの候補も通らなければ一次候補を残しつつ地図から除外 (⚠)
  */
 function resolveGeo(t: Trace): void {
   const o = t.useOrigin && origin?.geo.status === "ok" ? origin.geo : null;
   const hops = sortedHops(t);
-  // 隣接判定の基準には、そのホップで最も信頼できる候補 (ホスト名 > サーバの一次候補) を使う。
-  // 隣のホップの一次候補が誤っていると正しい候補まで弾いてしまう連鎖を避けるため
-  const primaryOf = (h: Hop) => {
+  type Pos = { lat: number; lon: number };
+
+  const originOk = (h: Hop, c: Pos) =>
+    !o ||
+    o.lat == null ||
+    o.lon == null ||
+    h.rtt == null ||
+    haversine(o.lat, o.lon, c.lat, c.lon) <= h.rtt * KM_PER_MS * 1_000 * 1.15 + 50_000;
+
+  const candidatesOf = (h: Hop): GeoCandidate[] => {
     const g = h.geo;
-    if (!g || g.status !== "ok") return null;
-    const fromHost = hostnameLocation(h.hostname);
-    if (fromHost) return fromHost;
-    const c = g.candidates?.[0];
-    return c ?? (g.lat != null && g.lon != null ? { lat: g.lat, lon: g.lon } : null);
-  };
-  for (let i = 0; i < hops.length; i++) {
-    const hop = hops[i];
-    hop.geoSuspect = false;
-    const g = hop.geo;
-    if (!g || g.status !== "ok" || hop.rtt == null) continue;
-    const serverCandidates = g.candidates?.length
+    if (!g || g.status !== "ok") return [];
+    const server: GeoCandidate[] = g.candidates?.length
       ? g.candidates
       : g.lat != null && g.lon != null
         ? [{ source: g.source ?? "ip-api", lat: g.lat, lon: g.lon, city: g.city, country: g.country, countryCode: g.countryCode }]
         : [];
     // 逆引きホスト名の地名コード (sttlwa, chcgil, lax ...) は事業者自身の命名なので最優先
-    const fromHost = hostnameLocation(hop.hostname);
-    const candidates = fromHost ? [fromHost, ...serverCandidates] : serverCandidates;
-    if (candidates.length === 0) continue;
+    const fromHost = hostnameLocation(h.hostname);
+    return fromHost ? [fromHost, ...server] : server;
+  };
+  const cands = hops.map(candidatesOf);
 
-    // 基準となる隣接ホップ: RTT 差が最小の、位置が分かっているホップ
-    let ref: { lat: number; lon: number; dRtt: number } | null = null;
-    for (const dir of [-1, 1]) {
-      for (let j = i + dir; j >= 0 && j < hops.length; j += dir) {
-        const other = hops[j];
-        if (other.rtt == null) continue;
-        const p = primaryOf(other);
-        if (!p) continue;
-        const dRtt = Math.abs(hop.rtt - other.rtt);
-        if (!ref || dRtt < ref.dRtt) ref = { lat: p.lat, lon: p.lon, dRtt };
-        break;
-      }
+  // 仮の基準位置: ホスト名候補は他ソースと 500km 以内で一致するときだけ信用する
+  let refs: (Pos | null)[] = hops.map((h, i) => {
+    const cs = cands[i];
+    if (cs.length === 0) return null;
+    const host = cs.find((c) => c.source === "hostname");
+    const server = cs.filter((c) => c.source !== "hostname");
+    if (host) {
+      const agrees = server.some((s) => haversine(host.lat, host.lon, s.lat, s.lon) < 500_000);
+      if (agrees) return host;
+      return server[0] ?? (originOk(h, host) ? host : null);
     }
+    return server[0] ?? null;
+  });
 
-    const plausible = (c: { lat: number; lon: number }) => {
-      if (o && o.lat != null && o.lon != null) {
-        if (haversine(o.lat, o.lon, c.lat, c.lon) > hop.rtt! * KM_PER_MS * 1_000 * 1.15 + 50_000) return false;
+  const picks: ({ pick: GeoCandidate; ok: boolean } | null)[] = hops.map(() => null);
+  for (let iter = 0; iter < 2; iter++) {
+    for (let i = 0; i < hops.length; i++) {
+      const hop = hops[i];
+      const cs = cands[i];
+      if (cs.length === 0 || hop.rtt == null) {
+        picks[i] = null;
+        continue;
       }
-      if (ref) {
-        if (haversine(ref.lat, ref.lon, c.lat, c.lon) > (ref.dRtt + RTT_SLACK_MS) * KM_PER_MS * 1_000) return false;
+      // 基準となる隣接ホップ: RTT 差が最小の、位置が分かっているホップ
+      let ref: { lat: number; lon: number; dRtt: number } | null = null;
+      for (const dir of [-1, 1]) {
+        for (let j = i + dir; j >= 0 && j < hops.length; j += dir) {
+          const other = hops[j];
+          if (other.rtt == null) continue;
+          const p = refs[j];
+          if (!p) continue;
+          const dRtt = Math.abs(hop.rtt - other.rtt);
+          if (!ref || dRtt < ref.dRtt) ref = { lat: p.lat, lon: p.lon, dRtt };
+          break;
+        }
       }
-      return true;
-    };
+      const plausible = (c: Pos) =>
+        originOk(hop, c) &&
+        (!ref || haversine(ref.lat, ref.lon, c.lat, c.lon) <= (ref.dRtt + RTT_SLACK_MS) * KM_PER_MS * 1_000);
+      const chosen = cs.find(plausible);
+      picks[i] = { pick: chosen ?? cs[0], ok: !!chosen };
+    }
+    // 検証を通った位置を次の反復の基準にする
+    refs = picks.map((p, i) => (p?.ok ? p.pick : refs[i]));
+  }
 
-    const chosen = candidates.find(plausible);
-    const pick = chosen ?? candidates[0];
-    g.lat = pick.lat;
-    g.lon = pick.lon;
-    g.city = pick.city ?? g.city;
-    g.country = pick.country ?? g.country;
-    g.countryCode = pick.countryCode ?? g.countryCode;
-    g.source = pick.source;
-    g.geoScore = pick.score;
-    g.geoEngines = pick.engines;
-    if (!chosen) hop.geoSuspect = true;
+  for (let i = 0; i < hops.length; i++) {
+    const hop = hops[i];
+    hop.geoSuspect = false;
+    const g = hop.geo;
+    const p = picks[i];
+    if (!g || !p) continue;
+    // 候補が都市名を持たないときは DB 側の値で補う (前回の採用値を引きずらない)
+    const db = cands[i].find((c) => c.source === "ip-api") ?? cands[i].find((c) => c.source !== "hostname");
+    g.lat = p.pick.lat;
+    g.lon = p.pick.lon;
+    g.city = p.pick.city ?? db?.city;
+    g.country = p.pick.country ?? db?.country;
+    g.countryCode = p.pick.countryCode ?? db?.countryCode;
+    g.source = p.pick.source;
+    g.geoScore = p.pick.score;
+    g.geoEngines = p.pick.engines;
+    if (!p.ok) hop.geoSuspect = true;
   }
 }
 
@@ -419,24 +448,21 @@ function requestRoadPath(a: ChainNode, b: ChainNode, len: number): void {
   void fetch(`/api/route?${q}`)
     .then((r) => r.json())
     .then((j: { code?: string; distance?: number | null; coordinates?: [number, number][] | null }) => {
-      let val: RoadPath | null = null;
-      // 大きく迂回するルート (海を回り込む等) は道路沿いとはみなさない
-      if (
-        j.code === "Ok" &&
-        Array.isArray(j.coordinates) &&
-        j.coordinates.length >= 2 &&
-        typeof j.distance === "number" &&
-        j.distance <= len * 2.2
-      ) {
-        val = { coords: j.coordinates, distance: j.distance };
-      }
-      roadPathCache.set(key, val);
-      if (val && traces.size > 0) {
-        renderAll();
-        updateGlobe();
+      if (j.code === "Ok" && Array.isArray(j.coordinates) && j.coordinates.length >= 2 && typeof j.distance === "number") {
+        // 大きく迂回するルート (海を回り込む等) は道路沿いとはみなさない
+        const val: RoadPath | null = j.distance <= len * 2.2 ? { coords: j.coordinates, distance: j.distance } : null;
+        roadPathCache.set(key, val);
+        if (val && traces.size > 0) {
+          renderAll();
+          updateGlobe();
+        }
+      } else if (j.code === "NoRoute") {
+        roadPathCache.set(key, null); // 確定: 道路で繋がらない
+      } else {
+        roadPathCache.delete(key); // 一時的な失敗 (タイムアウト・429 等) は次の描画で再試行
       }
     })
-    .catch(() => roadPathCache.set(key, null));
+    .catch(() => roadPathCache.delete(key));
 }
 
 /** 道路沿い推定を適用した区間: 終点ノードの先頭ホップ TTL → 道路距離 (km) */
@@ -446,7 +472,8 @@ function legRoadInfo(t: Trace): Map<number, number> {
   for (let i = 0; i + 1 < nodes.length; i++) {
     const a = nodes[i];
     const b = nodes[i + 1];
-    if (legPathCache.get(legKey(a, b).key)) continue; // ケーブル線形が優先
+    // 海底ケーブルの候補がある区間は (線形が辿れなくても) 陸上区間ではない
+    if (cables.length > 0 && candidatesFor(a, b).length > 0) continue;
     const road = roadPathCache.get(`${a.key}>${b.key}`);
     const firstHop = b.hops[0];
     if (road && road !== "pending" && firstHop) map.set(firstHop.ttl, road.distance / 1000);
@@ -468,14 +495,16 @@ function legPathsFor(t: Trace): Map<string, [number, number][]> {
     const chainKey = `${a.key}>${b.key}`;
     const len = haversine(a.lat, a.lng, b.lat, b.lng);
     let path: [number, number][] | null = null;
+    let hasCable = false;
     if (cables.length > 0) {
       const { key } = legKey(a, b);
+      const cands = candidatesFor(a, b);
+      hasCable = cands.length > 0;
       const cached = legPathCache.get(key);
       if (cached !== undefined) {
         path = cached;
       } else {
-        const best = candidatesFor(a, b)[0];
-        const core = best?.corePath ?? null;
+        const core = cands[0]?.corePath ?? null;
         if (core) {
           const start = { lng: core[0][0], lat: core[0][1] };
           const end = { lng: core[core.length - 1][0], lat: core[core.length - 1][1] };
@@ -486,7 +515,8 @@ function legPathsFor(t: Trace): Map<string, [number, number][]> {
         legPathCache.set(key, path);
       }
     }
-    if (!path && isTerrestrialLeg(a, b, len)) {
+    // ケーブル候補がある区間は線形が辿れなくても大円のまま (道路+フェリーの線にしない)
+    if (!path && !hasCable && isTerrestrialLeg(a, b, len)) {
       const road = roadPathCache.get(chainKey);
       if (road === undefined) requestRoadPath(a, b, len);
       else if (road && road !== "pending") path = road.coords;
@@ -988,7 +1018,9 @@ function addLiveTrace(host: string, family: 4 | 6, proto: "icmp" | "udp") {
       case "hop": {
         const hop: Hop = { ttl: ev.ttl, ip: ev.ip, rtt: ev.rtt, note: ev.note };
         if (ev.ip) {
-          hop.geo = geoByIp.get(ev.ip);
+          // resolveGeo がホップごとに書き換えるので、共有キャッシュの複製を持たせる
+          const cachedGeo = geoByIp.get(ev.ip);
+          hop.geo = cachedGeo ? { ...cachedGeo } : undefined;
           hop.hostname = rdnsByIp.get(ev.ip);
         }
         t.hops.set(ev.ttl, hop);
@@ -1000,7 +1032,7 @@ function addLiveTrace(host: string, family: 4 | 6, proto: "icmp" | "udp") {
         geoByIp.set(ev.ip, ev.geo);
         for (const tr of traces.values()) {
           for (const hop of tr.hops.values()) {
-            if (hop.ip === ev.ip) hop.geo = ev.geo;
+            if (hop.ip === ev.ip) hop.geo = { ...ev.geo };
           }
         }
         renderAll();
@@ -1014,6 +1046,7 @@ function addLiveTrace(host: string, family: 4 | 6, proto: "icmp" | "udp") {
           }
         }
         renderAll();
+        updateGlobe(); // ホスト名の地名コードで位置が変わり得る
         break;
       case "info":
         t.lastInfo = ev.line;
@@ -1049,7 +1082,7 @@ function addHistoryTrace(rec: TraceRecord) {
     label: rec.label,
     family: rec.family,
     targetIp: rec.targetIp,
-    hops: new Map(rec.hops.map((h) => [h.ttl, { ...h }])),
+    hops: new Map(rec.hops.map((h) => [h.ttl, { ...h, geo: h.geo ? { ...h.geo } : undefined }])),
     status: "done",
     statusMsg: "履歴",
     handle: null,

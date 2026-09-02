@@ -287,7 +287,9 @@ interface LayerHandle {
 
 const CABLE_COLOR = "#2b5f8a";
 const CABLE_HI_COLOR = "#7ff3e6";
-const FIBER_COLOR = "#8a6a2b";
+// 経路の色スロット (シアン/オレンジ/バイオレット/グリーン) と海底ケーブル (青) の
+// どれとも紛れない、くすんだローズ
+const FIBER_COLOR = "#7d3f63";
 
 export class Globe {
   private view!: ThreeView<DefaultDescriptions>;
@@ -562,9 +564,18 @@ export class Globe {
         return; // カメラコア未接続の間はスキップ
       }
       const horizon = Math.sqrt((EARTH_R + camH) ** 2 - EARTH_R ** 2) * 1.01;
+      // 重なるチップは後勝ちで間引く (同じ都市に複数トレースが重なる場合や
+      // 俯瞰で欧州の都市が縁に圧縮される場合の判読不能を防ぐ)
+      const placed: { x: number; y: number }[] = [];
       for (const [id, el] of this.chips) {
         const pos = projected.get(id);
         if (pos && pos.distance < horizon) {
+          const collides = placed.some((p) => Math.abs(p.x - pos.x) < 70 && Math.abs(p.y - pos.y) < 20);
+          if (collides) {
+            el.style.display = "none";
+            continue;
+          }
+          placed.push({ x: pos.x, y: pos.y });
           el.style.display = "";
           el.style.opacity = String(Math.min(1, Math.max(0.35, 1.6 - pos.distance / 12_000_000)));
           moveOverlayElement(el, pos.x, pos.y);
@@ -639,8 +650,12 @@ export class Globe {
         legs.push({ a, b, dashed: isGapLeg(a, b), len, slot, path });
       }
     }
+    // 線形の中身 (ケーブル A→B、道路→ケーブル) が変わっても再描画されるよう、
+    // 上書き線形は点数と端点・中点で署名する
+    const pathSig = (p: [number, number][] | undefined) =>
+      p ? `c${p.length}:${p[0]}:${p[p.length >> 1]}:${p[p.length - 1]}` : "g";
     const shapeKey = legs
-      .map((l) => `${l.slot}:${l.a.key}>${l.b.key}:${l.dashed ? "d" : "s"}${l.path ? "c" : "g"}`)
+      .map((l) => `${l.slot}:${l.a.key}>${l.b.key}:${l.dashed ? "d" : "s"}${pathSig(l.path)}`)
       .join("|");
     if (shapeKey !== this.trackShapeKey) {
       this.trackShapeKey = shapeKey;

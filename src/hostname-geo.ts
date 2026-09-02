@@ -335,7 +335,7 @@ const CLLI: Record<string, Place> = {
   cpnhdk: CITY.copenhagen,
 };
 
-/** 事業者固有の略号 (IATA と衝突するものはドメインで限定) */
+/** 事業者固有の略号 (IATA と衝突するものはドメインで限定)。末尾の数字は無視する (man2 → man) */
 const OPERATOR_ALIASES: Array<{ domain: RegExp; tokens: Record<string, Place> }> = [
   {
     // Arelion (旧 Telia Carrier): xxx-bb#-link.ip.twelve99.net
@@ -359,18 +359,51 @@ const OPERATOR_ALIASES: Array<{ domain: RegExp; tokens: Record<string, Place> }>
       hnk: CITY.hongkong,
     },
   },
+  {
+    // NORDUnet: <cc>-<city>[n].nordu.net (us-man2 = Manhattan, dk-esbj = Esbjerg ...)
+    domain: /(^|\.)nordu\.net$/,
+    tokens: {
+      man: CITY.newyork,
+      chi: CITY.chicago,
+      ams: CITY.amsterdam,
+      lon: CITY.london,
+      hmb: CITY.hamburg,
+      esbj: P("Esbjerg", "Denmark", "DK", 55.47, 8.45),
+      bal: CITY.copenhagen,
+      ore: P("Örestad (Copenhagen)", "Denmark", "DK", 55.63, 12.58),
+      cph: CITY.copenhagen,
+      sthb: CITY.stockholm,
+      sth: CITY.stockholm,
+      tug: P("Tulinge (Stockholm)", "Sweden", "SE", 59.2, 17.9),
+      osl: CITY.oslo,
+      hel: CITY.helsinki,
+      csc: P("Espoo (CSC)", "Finland", "FI", 60.18, 24.83),
+    },
+  },
 ];
+
+/** 都市名そのもの (sanjose, los-angeles, new_york ...) の照合表。CITY のキーから作る */
+const CITY_NAMES: Record<string, Place> = Object.fromEntries(
+  Object.entries(CITY).map(([k, v]) => [k, v]),
+);
+
+const stripDigits = (t: string) => t.replace(/\d+$/, "");
 
 export function hostnameLocation(hostname: string | null | undefined): GeoCandidate | null {
   if (!hostname) return null;
-  const host = hostname.toLowerCase();
-  const tokens = host.split(/[.\-_]/).filter(Boolean);
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  const labels = host.split(".").filter(Boolean);
+  // ドメイン部 (末尾 2 ラベル: 例 ntt.net, disa.mil) は地名として扱わない。
+  // ".mil" が Milan、"cdn.man.net" の "man" が Manchester になるのを防ぐ
+  const hostLabels = labels.length >= 3 ? labels.slice(0, -2) : labels.slice(0, 1);
+  const tokens = hostLabels.flatMap((l) => l.split(/[-_]/)).filter(Boolean);
   let place: Place | null = null;
 
+  // 1. 事業者固有の略号 (ドメイン限定)
   for (const alias of OPERATOR_ALIASES) {
     if (!alias.domain.test(host)) continue;
     for (const t of tokens) {
-      const p = alias.tokens[t];
+      const p = alias.tokens[t] ?? alias.tokens[stripDigits(t)];
       if (p) {
         place = p;
         break;
@@ -378,9 +411,21 @@ export function hostnameLocation(hostname: string | null | undefined): GeoCandid
     }
     if (place) break;
   }
+  // 2. 都市名そのもの (連続トークンを 3→2→1 語で結合して照合: "san","jose" → sanjose)
+  if (!place) {
+    outer: for (let size = 3; size >= 1 && !place; size--) {
+      for (let i = 0; i + size <= tokens.length; i++) {
+        const joined = tokens.slice(i, i + size).join("");
+        if (/^[a-z]+$/.test(joined) && CITY_NAMES[joined]) {
+          place = CITY_NAMES[joined];
+          break outer;
+        }
+      }
+    }
+  }
+  // 3. CLLI 風: 英字6文字 + 任意の数字 (sttlwa01)
   if (!place) {
     for (const t of tokens) {
-      // CLLI 風: 英字6文字 + 任意の数字 (sttlwa01)
       const m = t.match(/^([a-z]{6})\d{0,3}$/);
       if (m && CLLI[m[1]]) {
         place = CLLI[m[1]];
@@ -388,9 +433,15 @@ export function hostnameLocation(hostname: string | null | undefined): GeoCandid
       }
     }
   }
+  // 4. IATA 3文字 (数字を含まない単独トークンのみ)。"san"/"los" のような
+  //    複数語都市名の一部は 2. で先に拾われるので、ここに来るのは単独の場合だけ。
+  //    直後が数字のトークン (gig-0-1, sat-1 のようなインタフェース名) は除外する
   if (!place) {
-    for (const t of tokens) {
-      if (t.length === 3 && IATA[t]) {
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      const next = tokens[i + 1];
+      if (next !== undefined && /^\d+$/.test(next)) continue;
+      if (/^[a-z]{3}$/.test(t) && IATA[t]) {
         place = IATA[t];
         break;
       }

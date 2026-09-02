@@ -101,6 +101,13 @@ interface CableGraph {
 
 const graphCache = new WeakMap<CableInfo, CableGraph>();
 
+/** 座標を約1km格子のキーにする。±180° は同じ節点とみなす (日付変更線で分割されたパーツを繋ぐ) */
+function gridKey(lng: number, lat: number): string {
+  let x = Math.round(lng * 100);
+  if (x <= -18000) x = 18000;
+  return `${x},${Math.round(lat * 100)}`;
+}
+
 function cableGraph(cable: CableInfo): CableGraph {
   const cached = graphCache.get(cable);
   if (cached) return cached;
@@ -108,31 +115,65 @@ function cableGraph(cable: CableInfo): CableGraph {
   const edges: CableGraph["edges"] = [];
   const adj = new Map<number, number[]>();
   const index = new Map<string, number>();
-  // 端点は約1kmで丸めて同一視する (分岐点で共有される座標のわずかな差を吸収)
+
+  // 節点は格子キー + 隣接 8 セル (≈1〜2km) で同一視する。分岐ケーブルの端点が
+  // 幹線の途中の頂点にわずかにずれて接続している (T 字) ケースを吸収するため
+  const lookup = (lng: number, lat: number): number | undefined => {
+    const x = Math.round(lng * 100);
+    const y = Math.round(lat * 100);
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const i = index.get(gridKey((x + dx) / 100, (y + dy) / 100));
+        if (i !== undefined) return i;
+      }
+    }
+    return undefined;
+  };
   const nodeFor = (c: LngLat) => {
-    const key = `${c[0].toFixed(2)},${c[1].toFixed(2)}`;
-    let i = index.get(key);
+    let i = lookup(c[0], c[1]);
     if (i === undefined) {
       i = nodes.length;
       nodes.push({ lng: c[0], lat: c[1] });
-      index.set(key, i);
     }
+    index.set(gridKey(c[0], c[1]), i);
     return i;
   };
+
+  const parts: LngLat[][] = [];
   for (const f of cable.features) {
     for (const part of f.geometry.coordinates) {
-      if (part.length < 2) continue;
-      const a = nodeFor(part[0]);
-      const b = nodeFor(part[part.length - 1]);
-      let len = 0;
-      for (let i = 1; i < part.length; i++) {
-        len += haversine(part[i - 1][1], part[i - 1][0], part[i][1], part[i][0]);
-      }
-      const idx = edges.length;
-      edges.push({ a, b, coords: part, len });
-      (adj.get(a) ?? adj.set(a, []).get(a)!).push(idx);
-      (adj.get(b) ?? adj.set(b, []).get(b)!).push(idx);
+      if (part.length >= 2) parts.push(part);
     }
+  }
+  // まず全パーツの端点を節点として登録
+  for (const part of parts) {
+    nodeFor(part[0]);
+    nodeFor(part[part.length - 1]);
+  }
+  // 幹線の途中に他パーツの端点が乗っていれば、そこでパーツを分割してエッジ化
+  const addEdge = (coords: LngLat[]) => {
+    if (coords.length < 2) return;
+    const a = nodeFor(coords[0]);
+    const b = nodeFor(coords[coords.length - 1]);
+    if (a === b && coords.length < 3) return;
+    let len = 0;
+    for (let i = 1; i < coords.length; i++) {
+      len += haversine(coords[i - 1][1], coords[i - 1][0], coords[i][1], coords[i][0]);
+    }
+    const idx = edges.length;
+    edges.push({ a, b, coords, len });
+    (adj.get(a) ?? adj.set(a, []).get(a)!).push(idx);
+    (adj.get(b) ?? adj.set(b, []).get(b)!).push(idx);
+  };
+  for (const part of parts) {
+    let start = 0;
+    for (let i = 1; i < part.length - 1; i++) {
+      if (lookup(part[i][0], part[i][1]) !== undefined) {
+        addEdge(part.slice(start, i + 1));
+        start = i;
+      }
+    }
+    addEdge(part.slice(start));
   }
   const g = { nodes, edges, adj };
   graphCache.set(cable, g);
