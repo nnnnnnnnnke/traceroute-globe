@@ -16,6 +16,7 @@ import {
   inferCables,
   loadCables,
   type CableCandidate,
+  type CableDetail,
   type CableInfo,
 } from "./cables";
 import { hostnameLocation } from "./hostname-geo";
@@ -63,6 +64,7 @@ let follow = true;
 let uiMessage: string | null = null; // 一時的な操作エラー等の表示 (renderStatus が描画)
 let cables: CableInfo[] = []; // 海底ケーブル (読み込み後)
 const cableInferCache = new Map<string, CableCandidate[]>(); // 区間キー → 推定結果
+const cableDetails = new Map<string, CableDetail | null | "pending">(); // ケーブル詳細 (所有者など)
 const legPathCache = new Map<string, [number, number][] | null>(); // 区間キー → ケーブル沿いの線形
 
 const globe = new Globe();
@@ -317,7 +319,10 @@ function resolveGeo(t: Trace): void {
   // IPmap > ip-api、僅差のタイブレーク) の合計が最小になる候補列を動的計画法で選ぶ。
   // 隣接ホップ同士を順に基準にする反復だと互いを基準に振動するため、列全体で解く
   const located = hops.map((_, i) => i).filter((i) => cands[i].length > 0 && hops[i].rtt != null);
-  const rank = (c: GeoCandidate) => (c.source === "hostname" ? 0 : c.source === "ipmap" ? 1 : 2);
+  // ソースの信頼順: ホスト名 (事業者自身の命名) > IPmap (実測) > ip-api (登録住所ベース)。
+  // RTT の揺れによる「違反1件」(コスト≈1) と同程度の差を付け、ホスト名の明示的な
+  // 地名が DB の当て推量に負けないようにする
+  const rankCost = (c: GeoCandidate) => (c.source === "hostname" ? 0 : c.source === "ipmap" ? 0.5 : 1.0);
   const originCost = (h: Hop, c: Pos) => {
     if (originOk(h, c)) return 0;
     const allowed = (h.rtt ?? 0) * KM_PER_MS * 1_000 * 1.15 + 50_000;
@@ -332,7 +337,7 @@ function resolveGeo(t: Trace): void {
   let prevIdx: number | null = null;
   for (const i of located) {
     const cs = cands[i];
-    const cost = cs.map((c) => rank(c) * 0.05 + originCost(hops[i], c));
+    const cost = cs.map((c) => rankCost(c) + originCost(hops[i], c));
     const prev = cs.map(() => -1);
     if (prevIdx !== null) {
       const pb = best.get(prevIdx)!;
@@ -425,6 +430,42 @@ function legKey(a: ChainNode, b: ChainNode): { key: string; rttDelta: number | n
   return { key: `${a.key}>${b.key}:${rttDelta == null ? "-" : Math.round(rttDelta)}`, rttDelta };
 }
 
+/** ホップの AS 名から事業者名のトークンを取り出す ("AS2914 NTT America, Inc." → "ntt") */
+function operatorTokens(n: ChainNode): string[] {
+  const out: string[] = [];
+  for (const h of n.hops) {
+    const as = h.geo?.as ?? "";
+    const m = as.match(/^AS\d+\s+([A-Za-z][A-Za-z0-9]+)/);
+    if (m) out.push(m[1].toLowerCase());
+  }
+  return out;
+}
+
+/** ケーブル詳細 (所有者) を裏で取得し、届いたら再描画する */
+function ensureCableDetails(ids: string[]): void {
+  for (const id of ids) {
+    if (cableDetails.has(id)) continue;
+    cableDetails.set(id, "pending");
+    void fetchCableDetail(id)
+      .then((d) => {
+        cableDetails.set(id, d);
+        if (traces.size > 0) {
+          renderAll();
+          updateGlobe();
+        }
+      })
+      .catch(() => cableDetails.set(id, null));
+  }
+}
+
+/** ケーブルの所有者に区間両端のホップの事業者が含まれていれば、そのケーブルを優先する */
+function ownerMatches(c: CableCandidate, tokens: string[]): boolean {
+  const d = cableDetails.get(c.cable.id);
+  if (!d || d === "pending" || !d.owners) return false;
+  const owners = d.owners.toLowerCase();
+  return tokens.some((t) => t.length >= 3 && owners.includes(t));
+}
+
 function candidatesFor(a: ChainNode, b: ChainNode): CableCandidate[] {
   const { key, rttDelta } = legKey(a, b);
   let cands = cableInferCache.get(key);
@@ -432,7 +473,13 @@ function candidatesFor(a: ChainNode, b: ChainNode): CableCandidate[] {
     cands = inferCables(a, b, cables, rttDelta);
     cableInferCache.set(key, cands);
   }
-  return cands;
+  if (cands.length === 0) return cands;
+  ensureCableDetails(cands.map((c) => c.cable.id));
+  // 所有者一致は強い根拠 (例: NTT のホップ → NTT 自社の PC-1) なので 1,500km 相当の加点
+  const tokens = [...operatorTokens(a), ...operatorTokens(b)];
+  return [...cands]
+    .map((c) => ({ ...c, score: c.score - (ownerMatches(c, tokens) ? 1_500_000 : 0) }))
+    .sort((x, y) => x.score - y.score);
 }
 
 /** 各区間の海底ケーブル推定。キーは区間の終点ノードの先頭ホップ TTL */
@@ -523,9 +570,9 @@ function legPathsFor(t: Trace): Map<string, [number, number][]> {
     let path: [number, number][] | null = null;
     let hasCable = false;
     if (cables.length > 0) {
-      const { key } = legKey(a, b);
       const cands = candidatesFor(a, b);
       hasCable = cands.length > 0;
+      const key = `${legKey(a, b).key}:${cands[0]?.cable.id ?? "-"}`;
       const cached = legPathCache.get(key);
       if (cached !== undefined) {
         path = cached;
@@ -571,6 +618,11 @@ function statsText(t: Trace, nodes: ChainNode[]): string {
     }
   }
   return parts.join(" · ");
+}
+
+/** "Shima, Japan" → "Shima" のように国名を落として短くする */
+function shortLanding(name: string): string {
+  return name.split(",")[0].trim();
 }
 
 function buildHopRow(
@@ -623,8 +675,11 @@ function buildHopRow(
         b.type = "button";
         b.className = "cable-name" + (i === 0 ? " best" : "");
         b.textContent = c.cable.name;
+        const detail = cableDetails.get(c.cable.id);
+        const owners = detail && detail !== "pending" && detail.owners ? ` · 所有: ${detail.owners}` : "";
         b.title =
-          `着陸点までの距離: ${Math.round(c.landingA / 1000)} km / ${Math.round(c.landingB / 1000)} km` +
+          `${c.landingNameA} → ${c.landingNameB}${owners}` +
+          ` · 着陸点までの距離: ${Math.round(c.landingA / 1000)} km / ${Math.round(c.landingB / 1000)} km` +
           ` · 線形 ${Math.round(c.pathLen / 1000).toLocaleString("ja-JP")} km (RTT 期待値 +${c.expectedMs.toFixed(0)} ms)`;
         b.addEventListener("click", (e) => {
           e.stopPropagation();
@@ -634,6 +689,12 @@ function buildHopRow(
         });
         hint.append(b);
       });
+      // 最有力候補の着陸点 (どこから海に出て、どこに上がるか) を明示する
+      const best = cableCands[0];
+      const landing = document.createElement("span");
+      landing.className = "cable-landing";
+      landing.textContent = `${shortLanding(best.landingNameA)} → ${shortLanding(best.landingNameB)}`;
+      hint.append(landing);
       main.append(hint);
     }
     if (roadKm != null) {

@@ -535,6 +535,10 @@ function handleCables(req: IncomingMessage, res: ServerResponse): boolean {
     void proxyCableJson("cable/cable-geo.json", res);
     return true;
   }
+  if (path === "/api/cables/landing") {
+    void proxyCableJson("landing-point/landing-point-geo.json", res);
+    return true;
+  }
   const m = path.match(/^\/api\/cables\/([^/]+)$/);
   if (m && CABLE_ID_RE.test(m[1])) {
     void proxyCableJson(`cable/${m[1]}.json`, res);

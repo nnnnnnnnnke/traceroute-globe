@@ -18,13 +18,21 @@ export interface CableCollection {
   features: CableFeature[];
 }
 
+export interface Landing {
+  id: string;
+  name: string; // 例: "Shima, Japan"
+  lat: number;
+  lng: number;
+}
+
 export interface CableInfo {
   id: string;
   name: string;
   color: string;
   label: { lng: number; lat: number };
-  /** 各ラインパーツの始点・終点 (= 着陸点かブランチ点) */
-  ends: { lat: number; lng: number }[];
+  /** 着陸点 (landing-point データとの空間結合)。見つからないケーブルはパーツ端点で代用 */
+  ends: Landing[];
+  landings: Landing[];
   features: CableFeature[];
 }
 
@@ -32,6 +40,9 @@ export interface CableCandidate {
   cable: CableInfo;
   landingA: number; // 区間の始点側ホップから最寄り着陸点までの距離 (m)
   landingB: number;
+  /** 区間の両端で使うと推定した着陸点 */
+  landingNameA: string;
+  landingNameB: string;
   score: number;
   /** ケーブル線形に沿った区間長 (m)。線形が辿れない場合は着陸点間の直線距離 */
   pathLen: number;
@@ -50,10 +61,61 @@ export interface CableDetail {
   landing_points?: { name: string; country: string }[];
 }
 
+interface LandingCollection {
+  type: "FeatureCollection";
+  features: Array<{
+    properties: { id: string; name: string };
+    geometry: { type: "Point"; coordinates: [number, number] };
+  }>;
+}
+
+/** 着陸点をケーブル線の頂点にこの距離以内で結び付ける (データ上はほぼ同一座標) */
+const LANDING_SNAP_M = 3_000;
+
 export async function loadCables(): Promise<{ geojson: CableCollection; cables: CableInfo[] }> {
-  const res = await fetch("/api/cables");
+  const [res, lres] = await Promise.all([fetch("/api/cables"), fetch("/api/cables/landing")]);
   if (!res.ok) throw new Error(`cables: HTTP ${res.status}`);
   const geojson = (await res.json()) as CableCollection;
+  // 着陸点は無くても動く (パーツ端点で代用) が、リング型ケーブルの着陸点は
+  // 線の途中の頂点なので、これが無いと PC-1 のようなケーブルが候補にならない
+  const landings: Landing[] = [];
+  if (lres.ok) {
+    const lgj = (await lres.json()) as LandingCollection;
+    for (const f of lgj.features ?? []) {
+      landings.push({
+        id: f.properties.id,
+        name: f.properties.name,
+        lng: f.geometry.coordinates[0],
+        lat: f.geometry.coordinates[1],
+      });
+    }
+  }
+  // 0.05° 格子で着陸点を索引し、各ケーブルの頂点から近い着陸点を集める
+  const grid = new Map<string, Landing[]>();
+  const gkey = (lng: number, lat: number) => `${Math.round(lng * 20)},${Math.round(lat * 20)}`;
+  for (const l of landings) {
+    const k = gkey(l.lng, l.lat);
+    (grid.get(k) ?? grid.set(k, []).get(k)!).push(l);
+  }
+  const landingsNear = (vertices: LngLat[]): Landing[] => {
+    const found = new Map<string, { l: Landing; d: number }>();
+    for (const v of vertices) {
+      const x = Math.round(v[0] * 20);
+      const y = Math.round(v[1] * 20);
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          for (const l of grid.get(`${x + dx},${y + dy}`) ?? []) {
+            const d = haversine(v[1], v[0], l.lat, l.lng);
+            if (d > LANDING_SNAP_M) continue;
+            const prev = found.get(l.id);
+            if (!prev || d < prev.d) found.set(l.id, { l, d });
+          }
+        }
+      }
+    }
+    return [...found.values()].map((x) => x.l);
+  };
+
   const byId = new Map<string, CableInfo>();
   for (const f of geojson.features) {
     const p = f.properties;
@@ -65,16 +127,30 @@ export async function loadCables(): Promise<{ geojson: CableCollection; cables: 
         color: p.color,
         label: { lng: p.coordinates[0], lat: p.coordinates[1] },
         ends: [],
+        landings: [],
         features: [],
       };
       byId.set(p.id, c);
     }
     c.features.push(f);
-    for (const part of f.geometry.coordinates) {
-      if (part.length === 0) continue;
-      const s = part[0];
-      const e = part[part.length - 1];
-      c.ends.push({ lng: s[0], lat: s[1] }, { lng: e[0], lat: e[1] });
+  }
+  for (const c of byId.values()) {
+    const vertices = c.features.flatMap((f) => f.geometry.coordinates.flat());
+    c.landings = landingsNear(vertices);
+    if (c.landings.length > 0) {
+      c.ends = c.landings;
+    } else {
+      for (const f of c.features) {
+        for (const part of f.geometry.coordinates) {
+          if (part.length === 0) continue;
+          const s = part[0];
+          const e = part[part.length - 1];
+          c.ends.push(
+            { id: `${c.id}:s`, name: c.name, lng: s[0], lat: s[1] },
+            { id: `${c.id}:e`, name: c.name, lng: e[0], lat: e[1] },
+          );
+        }
+      }
     }
   }
   return { geojson, cables: [...byId.values()] };
@@ -145,7 +221,23 @@ function cableGraph(cable: CableInfo): CableGraph {
       if (part.length >= 2) parts.push(part);
     }
   }
-  // まず全パーツの端点を節点として登録
+  // 着陸点を、ケーブル線上の最寄り頂点にスナップして節点登録する。リング型の
+  // ケーブル (PC-1 など) は着陸点が線の途中にあり、ここで登録しないと分割されない
+  for (const l of cable.landings) {
+    let bestV: LngLat | null = null;
+    let bestD = LANDING_SNAP_M;
+    for (const part of parts) {
+      for (const v of part) {
+        const d = haversine(l.lat, l.lng, v[1], v[0]);
+        if (d < bestD) {
+          bestD = d;
+          bestV = v;
+        }
+      }
+    }
+    if (bestV) nodeFor(bestV);
+  }
+  // 全パーツの端点も節点として登録
   for (const part of parts) {
     nodeFor(part[0]);
     nodeFor(part[part.length - 1]);
@@ -284,8 +376,8 @@ export function inferCables(
   for (const c of cables) {
     let bestA = Infinity;
     let bestB = Infinity;
-    let endA: { lat: number; lng: number } | null = null;
-    let endB: { lat: number; lng: number } | null = null;
+    let endA: Landing | null = null;
+    let endB: Landing | null = null;
     for (const e of c.ends) {
       const da = haversine(a.lat, a.lng, e.lat, e.lng);
       if (da < bestA) {
@@ -311,11 +403,23 @@ export function inferCables(
     // 光ファイバの往復 ≈ 10ms / 1000km
     const expectedMs = pathLen / 100_000;
     let score = bestA + bestB + Math.abs(span - legLen) * 0.3;
-    // RTT 差が測れていれば「線形長から期待される増分」との差を距離換算 (1ms ≈ 100km) で加える
+    // RTT 差が測れていれば「線形長から期待される増分」との差を加える。ただし RTT は
+    // キューイングや非対称経路で ±20ms は普通に揺れるので、10ms の余裕を引いた上で
+    // 1ms ≈ 30km の弱い重みにとどめる (着陸点の近さのほうが強い根拠)
     if (rttDeltaMs != null && rttDeltaMs > 0) {
-      score += Math.abs(rttDeltaMs - expectedMs) * 100_000;
+      score += Math.max(0, Math.abs(rttDeltaMs - expectedMs) - 10) * 30_000;
     }
-    out.push({ cable: c, landingA: bestA, landingB: bestB, score, pathLen, expectedMs, corePath: path });
+    out.push({
+      cable: c,
+      landingA: bestA,
+      landingB: bestB,
+      landingNameA: endA.name,
+      landingNameB: endB.name,
+      score,
+      pathLen,
+      expectedMs,
+      corePath: path,
+    });
   }
   out.sort((x, y) => x.score - y.score);
   return out.slice(0, 3);

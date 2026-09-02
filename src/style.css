@@ -726,3 +726,9 @@ a.as-block:hover {
     max-width: calc(100vw - 32px);
   }
 }
+
+.cable-landing {
+  font-size: 10.5px;
+  color: #8fd6cd;
+  opacity: 0.85;
+}
