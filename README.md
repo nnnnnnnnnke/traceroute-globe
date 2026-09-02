@@ -28,13 +28,15 @@ compare IPv4 vs IPv6 paths side by side, and read the AS-level path at a glance.
   (English/Japanese), or `mtr --report` captured on any machine
 - **History overlays** — finished traces are kept in `localStorage` (up to 20);
   click to overlay up to 4 traces in different colors for comparison
-- **Router geolocation that holds up** — every hop is located with both a
-  general IP database (ip-api) and [RIPE IPmap](https://ipmap.ripe.net/)
-  (RIPE Atlas latency measurements, IXP data, geofeeds, crowdsourcing). The
-  client then picks the candidate that is physically consistent with the
-  measured RTTs (speed of light in fibre ≈ 100 km per ms of RTT, checked
-  against the origin and against the neighbouring hops) and flags hops that no
-  candidate can explain
+- **Router geolocation that holds up** — every hop gets up to three location
+  candidates: the operator's own naming in the reverse DNS name (CLLI/IATA
+  codes such as `sttlwa`, `chcgil`, `lax`, plus a few carrier-specific
+  abbreviations), [RIPE IPmap](https://ipmap.ripe.net/) (RIPE Atlas latency
+  measurements, IXP data, geofeeds, crowdsourcing) and a general IP database
+  (ip-api). The client picks, in that order of trust, the first candidate that
+  is physically consistent with the measured RTTs (speed of light in fibre ≈
+  100 km per ms of RTT, checked against the origin and against the
+  neighbouring hops) and flags hops that no candidate can explain
 - **Submarine cables** — every submarine cable system in the world
   (TeleGeography data, ~700 systems) drawn under the route. Click a cable to see
   its name, length, RFS year and owners
@@ -83,7 +85,7 @@ Open the URL Vite prints (e.g. http://localhost:5173).
 | Large dot | Destination |
 | Thin blue web | All submarine cable systems (toggle in the left panel) |
 | Thin amber lines | Terrestrial fibre routes from OFDS public data (toggle) |
-| Glowing teal cable | Estimated cable for an intercontinental segment (`🌊` in the hop panel); the route follows its path |
+| Glowing teal cable | The stretch of the estimated cable the route actually uses (`🌊` in the hop panel); the route follows it. Clicking a candidate name lights up the whole system |
 | Route along roads | Overland segment approximated on the road network (`🛣` in the hop panel) |
 
 Nearby hops (< 5 km) collapse into one site, labeled like `8–9 Chiyoda City`.
@@ -116,10 +118,14 @@ for hops, and DOM hop chips projected each frame via `OverlayPlugin` (hidden
 behind the horizon by a camera-altitude test).
 
 Cable inference (`src/cables.ts`): a segment qualifies if it is ≥ 600 km and
-crosses a border (or ≥ 1,500 km domestically); a cable is a candidate when one of
-its line endpoints lies within 350 km of each hop and those two endpoints are far
-enough apart to actually span the segment. Candidates are ranked by landing
-distance plus span mismatch.
+crosses a border (domestic segments are treated as terrestrial); a cable is a
+candidate when one of its line endpoints lies within 350 km of each hop and those
+two endpoints are far enough apart to actually span the segment. Candidates are
+ranked by landing distance, span mismatch and how well the cable's path length
+matches the measured RTT increase. The route follows the cable's geometry only
+when the shortest path through the cable's branches is at most 1.6× the
+straight-line distance — otherwise it would draw a detour that isn't the packet's
+path.
 
 This is a local tool: the dev server executes `traceroute` for whatever host the
 page asks for. Don't expose it beyond localhost.
