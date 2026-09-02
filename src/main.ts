@@ -67,7 +67,8 @@ const legPathCache = new Map<string, [number, number][] | null>(); // 区間キ�
 
 const globe = new Globe();
 if (import.meta.env.DEV) {
-  (window as unknown as { __globe: Globe }).__globe = globe;
+  (window as unknown as { __globe: Globe; __traces: Map<string, Trace> }).__globe = globe;
+  (window as unknown as { __globe: Globe; __traces: Map<string, Trace> }).__traces = traces;
 }
 
 const newId = () => `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
@@ -310,51 +311,76 @@ function resolveGeo(t: Trace): void {
   };
   const cands = hops.map(candidatesOf);
 
-  // 仮の基準位置: ホスト名候補は他ソースと 500km 以内で一致するときだけ信用する
-  let refs: (Pos | null)[] = hops.map((h, i) => {
+  // 位置が分かる (候補があり RTT もある) ホップ列に対して、
+  // 「隣接ホップ間の距離 ≤ 100km × (|ΔRTT| + 15ms)」の違反コストと
+  // 「発信元からの距離 ≤ 100km × RTT」の違反コスト、ソースの信頼順 (ホスト名 >
+  // IPmap > ip-api、僅差のタイブレーク) の合計が最小になる候補列を動的計画法で選ぶ。
+  // 隣接ホップ同士を順に基準にする反復だと互いを基準に振動するため、列全体で解く
+  const located = hops.map((_, i) => i).filter((i) => cands[i].length > 0 && hops[i].rtt != null);
+  const rank = (c: GeoCandidate) => (c.source === "hostname" ? 0 : c.source === "ipmap" ? 1 : 2);
+  const originCost = (h: Hop, c: Pos) => {
+    if (originOk(h, c)) return 0;
+    const allowed = (h.rtt ?? 0) * KM_PER_MS * 1_000 * 1.15 + 50_000;
+    return 1 + haversine(o!.lat!, o!.lon!, c.lat, c.lon) / allowed;
+  };
+  const transCost = (ha: Hop, a: Pos, hb: Hop, b: Pos) => {
+    const allowed = (Math.abs(ha.rtt! - hb.rtt!) + RTT_SLACK_MS) * KM_PER_MS * 1_000;
+    const d = haversine(a.lat, a.lon, b.lat, b.lon);
+    return d <= allowed ? 0 : 1 + (d - allowed) / allowed;
+  };
+  const best = new Map<number, { cost: number[]; prev: number[] }>();
+  let prevIdx: number | null = null;
+  for (const i of located) {
     const cs = cands[i];
-    if (cs.length === 0) return null;
-    const host = cs.find((c) => c.source === "hostname");
-    const server = cs.filter((c) => c.source !== "hostname");
-    if (host) {
-      const agrees = server.some((s) => haversine(host.lat, host.lon, s.lat, s.lon) < 500_000);
-      if (agrees) return host;
-      return server[0] ?? (originOk(h, host) ? host : null);
+    const cost = cs.map((c) => rank(c) * 0.05 + originCost(hops[i], c));
+    const prev = cs.map(() => -1);
+    if (prevIdx !== null) {
+      const pb = best.get(prevIdx)!;
+      const pcs = cands[prevIdx];
+      cs.forEach((c, ci) => {
+        let bestPrev = -1;
+        let bestCost = Infinity;
+        pcs.forEach((pc, pi) => {
+          const total = pb.cost[pi] + transCost(hops[prevIdx!], pc, hops[i], c);
+          if (total < bestCost) {
+            bestCost = total;
+            bestPrev = pi;
+          }
+        });
+        cost[ci] += bestCost;
+        prev[ci] = bestPrev;
+      });
     }
-    return server[0] ?? null;
-  });
-
-  const picks: ({ pick: GeoCandidate; ok: boolean } | null)[] = hops.map(() => null);
-  for (let iter = 0; iter < 2; iter++) {
-    for (let i = 0; i < hops.length; i++) {
-      const hop = hops[i];
-      const cs = cands[i];
-      if (cs.length === 0 || hop.rtt == null) {
-        picks[i] = null;
-        continue;
-      }
-      // 基準となる隣接ホップ: RTT 差が最小の、位置が分かっているホップ
-      let ref: { lat: number; lon: number; dRtt: number } | null = null;
-      for (const dir of [-1, 1]) {
-        for (let j = i + dir; j >= 0 && j < hops.length; j += dir) {
-          const other = hops[j];
-          if (other.rtt == null) continue;
-          const p = refs[j];
-          if (!p) continue;
-          const dRtt = Math.abs(hop.rtt - other.rtt);
-          if (!ref || dRtt < ref.dRtt) ref = { lat: p.lat, lon: p.lon, dRtt };
-          break;
-        }
-      }
-      const plausible = (c: Pos) =>
-        originOk(hop, c) &&
-        (!ref || haversine(ref.lat, ref.lon, c.lat, c.lon) <= (ref.dRtt + RTT_SLACK_MS) * KM_PER_MS * 1_000);
-      const chosen = cs.find(plausible);
-      picks[i] = { pick: chosen ?? cs[0], ok: !!chosen };
-    }
-    // 検証を通った位置を次の反復の基準にする
-    refs = picks.map((p, i) => (p?.ok ? p.pick : refs[i]));
+    best.set(i, { cost, prev });
+    prevIdx = i;
   }
+  // バックトラック
+  const choice = new Map<number, number>();
+  if (prevIdx !== null) {
+    let i: number | null = prevIdx;
+    let ci = best.get(i)!.cost.indexOf(Math.min(...best.get(i)!.cost));
+    for (let k = located.length - 1; k >= 0 && i !== null; k--) {
+      choice.set(i, ci);
+      const p = best.get(i)!.prev[ci];
+      i = k > 0 ? located[k - 1] : null;
+      ci = p;
+    }
+  }
+  // 疑わしいホップ: 発信元制約に反する、または前後の隣接制約に両方とも反する
+  // (端のホップは片側だけで判定)
+  const picks: ({ pick: GeoCandidate; ok: boolean } | null)[] = hops.map(() => null);
+  located.forEach((i, k) => {
+    const pick = cands[i][choice.get(i) ?? 0];
+    const violates = (j: number) =>
+      transCost(hops[i], pick, hops[j], cands[j][choice.get(j) ?? 0]) > 0;
+    const prevJ = k > 0 ? located[k - 1] : null;
+    const nextJ = k + 1 < located.length ? located[k + 1] : null;
+    const prevBad = prevJ !== null && violates(prevJ);
+    const nextBad = nextJ !== null && violates(nextJ);
+    const neighborBad =
+      prevJ !== null && nextJ !== null ? prevBad && nextBad : prevBad || nextBad;
+    picks[i] = { pick, ok: originOk(hops[i], pick) && !neighborBad };
+  });
 
   for (let i = 0; i < hops.length; i++) {
     const hop = hops[i];

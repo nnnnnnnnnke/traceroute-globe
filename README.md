@@ -33,10 +33,11 @@ compare IPv4 vs IPv6 paths side by side, and read the AS-level path at a glance.
   codes such as `sttlwa`, `chcgil`, `lax`, plus a few carrier-specific
   abbreviations), [RIPE IPmap](https://ipmap.ripe.net/) (RIPE Atlas latency
   measurements, IXP data, geofeeds, crowdsourcing) and a general IP database
-  (ip-api). The client picks, in that order of trust, the first candidate that
-  is physically consistent with the measured RTTs (speed of light in fibre ≈
-  100 km per ms of RTT, checked against the origin and against the
-  neighbouring hops) and flags hops that no candidate can explain
+  (ip-api). The client then solves for the whole hop sequence at once (dynamic
+  programming over the candidates), minimising violations of the speed of light
+  in fibre (≈ 100 km per ms of RTT, between neighbouring hops and against the
+  origin) with the source trust order as a tie-breaker, and flags hops that no
+  candidate can explain
 - **Submarine cables** — every submarine cable system in the world
   (TeleGeography data, ~700 systems) drawn under the route. Click a cable to see
   its name, length, RFS year and owners
