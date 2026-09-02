@@ -33,6 +33,10 @@ export interface CableCandidate {
   landingA: number; // 区間の始点側ホップから最寄り着陸点までの距離 (m)
   landingB: number;
   score: number;
+  /** ケーブル線形に沿った区間長 (m)。線形が辿れない場合は着陸点間の直線距離 */
+  pathLen: number;
+  /** 線形長から期待される RTT 増分 (ms, 往復 10ms/1000km) */
+  expectedMs: number;
 }
 
 export interface CableDetail {
@@ -224,6 +228,8 @@ export function inferCables(
   a: { lat: number; lng: number; countryCode?: string },
   b: { lat: number; lng: number; countryCode?: string },
   cables: CableInfo[],
+  /** 区間の両端ホップの RTT 差 (ms)。あれば線形長との整合で順位付けに使う */
+  rttDeltaMs?: number | null,
 ): CableCandidate[] {
   const legLen = haversine(a.lat, a.lng, b.lat, b.lng);
   if (legLen < MIN_LEG_M) return [];
@@ -252,9 +258,26 @@ export function inferCables(
     // 片側にしか着陸していない (同じ岸の2点が近いだけ) ケーブルを除外
     const span = haversine(endA.lat, endA.lng, endB.lat, endB.lng);
     if (span < legLen * 0.4) continue;
-    const score = bestA + bestB + Math.abs(span - legLen) * 0.3;
-    out.push({ cable: c, landingA: bestA, landingB: bestB, score });
+    // 線形が辿れればその長さ、無理なら着陸点間の直線 + 陸上スタブ
+    const path = cablePath(c, a, b);
+    const pathLen = (path ? pathLength(path) : span) + bestA + bestB;
+    // 光ファイバの往復 ≈ 10ms / 1000km
+    const expectedMs = pathLen / 100_000;
+    let score = bestA + bestB + Math.abs(span - legLen) * 0.3;
+    // RTT 差が測れていれば「線形長から期待される増分」との差を距離換算 (1ms ≈ 100km) で加える
+    if (rttDeltaMs != null && rttDeltaMs > 0) {
+      score += Math.abs(rttDeltaMs - expectedMs) * 100_000;
+    }
+    out.push({ cable: c, landingA: bestA, landingB: bestB, score, pathLen, expectedMs });
   }
   out.sort((x, y) => x.score - y.score);
   return out.slice(0, 3);
+}
+
+function pathLength(coords: LngLat[]): number {
+  let len = 0;
+  for (let i = 1; i < coords.length; i++) {
+    len += haversine(coords[i - 1][1], coords[i - 1][0], coords[i][1], coords[i][0]);
+  }
+  return len;
 }

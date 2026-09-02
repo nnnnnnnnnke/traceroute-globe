@@ -28,14 +28,28 @@ compare IPv4 vs IPv6 paths side by side, and read the AS-level path at a glance.
   (English/Japanese), or `mtr --report` captured on any machine
 - **History overlays** — finished traces are kept in `localStorage` (up to 20);
   click to overlay up to 4 traces in different colors for comparison
+- **Router geolocation that holds up** — every hop is located with both a
+  general IP database (ip-api) and [RIPE IPmap](https://ipmap.ripe.net/)
+  (RIPE Atlas latency measurements, IXP data, geofeeds, crowdsourcing). The
+  client then picks the candidate that is physically consistent with the
+  measured RTTs (speed of light in fibre ≈ 100 km per ms of RTT, checked
+  against the origin and against the neighbouring hops) and flags hops that no
+  candidate can explain
 - **Submarine cables** — every submarine cable system in the world
   (TeleGeography data, ~700 systems) drawn under the route. Click a cable to see
   its name, length, RFS year and owners
+- **Terrestrial fibre** — long-haul fibre routes digitised in the Open Fibre
+  Data Standard (OFDS public data, 22 countries) as a separate toggleable layer.
+  For overland segments with no such data the route is approximated along the
+  road network (OSRM), because long-haul fibre overwhelmingly follows roads and
+  railways; those segments are labelled `🛣` as estimates
 - **Which cable does my packet take?** — for each intercontinental segment the
   app estimates the cable(s) most likely used (landing points near both hops,
-  spanning the segment), lists the top candidates in the hop panel and lights up
-  the best one on the globe. It's a heuristic — traceroute can't see the
-  physical layer — so it's labeled as an estimate
+  spanning the segment, and a segment length that matches the measured RTT
+  increase), lists the top candidates in the hop panel, lights up the best one
+  on the globe and draws the route along that cable's actual path. It's a
+  heuristic — traceroute can't see the physical layer — so it's labeled as an
+  estimate
 - **Detail zoom** — NASA Black Marble for the overview, cross-fading into an
   OSM-based dark basemap (up to street level) as you zoom in. Routes are drawn
   as ground tracks in the tile pipeline, so lines and hop markers stay
@@ -68,7 +82,9 @@ Open the URL Vite prints (e.g. http://localhost:5173).
 | Colors | One color slot per trace: cyan → orange → violet → green |
 | Large dot | Destination |
 | Thin blue web | All submarine cable systems (toggle in the left panel) |
-| Glowing teal cable | Estimated cable for an intercontinental segment (`🌊` in the hop panel) |
+| Thin amber lines | Terrestrial fibre routes from OFDS public data (toggle) |
+| Glowing teal cable | Estimated cable for an intercontinental segment (`🌊` in the hop panel); the route follows its path |
+| Route along roads | Overland segment approximated on the road network (`🛣` in the hop panel) |
 
 Nearby hops (< 5 km) collapse into one site, labeled like `8–9 Chiyoda City`.
 The right panel lists every hop (IP, rDNS, city, ASN, RTT) — click one to fly
@@ -82,10 +98,15 @@ Browser (Vite + TypeScript + @navaramap/three)
   ├─ GET /api/trace    spawn traceroute, stream hops + geo + rDNS over SSE
   ├─ POST /api/enrich  batch geolocation + rDNS for paste mode
   ├─ GET /api/self     geolocate the local egress IP (origin marker)
-  └─ GET /api/cables   proxy + cache for TeleGeography's cable GeoJSON / details
+  ├─ GET /api/cables   proxy + cache for TeleGeography's cable GeoJSON / details
+  ├─ GET /api/fiber    OFDS terrestrial fibre spans, fetched, simplified and merged
+  └─ GET /api/route    road route between two points (OSRM demo server, serialised)
 Server side (server/api.ts, a Vite dev-server middleware)
-  └─ geolocation via ip-api.com /batch — throttled to its 15 req/min limit,
-     micro-batched and cached
+  ├─ geolocation: ip-api.com /batch (ASN, throttled to its 15 req/min limit)
+  │  + RIPE IPmap per IP (position, 4 in flight), both cached; the client
+  │  receives all candidates and resolves them against RTT
+  └─ terrestrial fibre: 27 OFDS GeoJSON files (~22 MB) → Douglas–Peucker
+     simplified to < 1 MB, cached on disk for a week
 ```
 
 On the Navara side: Black Marble raster + an OSM dark style cross-faded by
@@ -122,6 +143,9 @@ page asks for. Don't expose it beyond localhost.
   (© OpenStreetMap contributors)
 - IP geolocation: [ip-api.com](https://ip-api.com)
 - Submarine cable routes and details: [TeleGeography Submarine Cable Map](https://www.submarinecablemap.com/)
+- Router geolocation: [RIPE IPmap](https://ipmap.ripe.net/) (RIPE NCC)
+- Terrestrial fibre: [OFDS public data](https://github.com/Open-Telecoms-Data/OFDS-public-data) (Open Telecoms Data)
+- Road routing for overland estimates: [OSRM](http://project-osrm.org/) demo server, © OpenStreetMap contributors
 
 ## License
 

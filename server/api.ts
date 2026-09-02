@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
 import { promises as dns } from "node:dns";
+import { promises as fs } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import path from "node:path";
 import type { Plugin } from "vite";
 
 // ---------------------------------------------------------------------------
@@ -22,6 +24,19 @@ export interface GeoInfo {
   source?: "ipmap" | "ip-api";
   geoScore?: number;
   geoEngines?: string[];
+  /** 各ソースの候補位置。クライアントが RTT の物理整合性で選び直す */
+  candidates?: GeoCandidate[];
+}
+
+export interface GeoCandidate {
+  source: "ipmap" | "ip-api";
+  lat: number;
+  lon: number;
+  city?: string;
+  country?: string;
+  countryCode?: string;
+  score?: number;
+  engines?: string[];
 }
 
 /** ip-api + IPmap を合成した最終結果 */
@@ -185,8 +200,11 @@ async function lookupIpmap(ip: string): Promise<IpmapLocation | null> {
         ipmapCache.set(ip, null);
         return null;
       }
-      const contributions = (loc.contributions ?? {}) as Record<string, unknown>;
+      const contributions = (loc.contributions ?? {}) as Record<string, { confirmations?: number } | undefined>;
       const engines = Object.keys(contributions);
+      // latency エンジンは他プローブによる確認 (confirmations) が無い単発計測だと
+      // 大きく外すことがある (例: 確認0回の 0.2ms 計測で豪州判定) ので根拠に数えない
+      const latencyConfirmed = (contributions.latency?.confirmations ?? 0) >= 1;
       const r: IpmapLocation = {
         lat: loc.latitude,
         lon: loc.longitude as number,
@@ -195,7 +213,10 @@ async function lookupIpmap(ip: string): Promise<IpmapLocation | null> {
         countryCode: (loc.countryCodeAlpha2 as string) || undefined,
         score: Number(loc.score ?? j.score ?? 0),
         engines,
-        strong: engines.some((e) => e !== "worlds") || Boolean(j.geofeed),
+        strong:
+          latencyConfirmed ||
+          engines.some((e) => e !== "worlds" && e !== "latency") ||
+          Boolean(j.geofeed),
       };
       ipmapCache.set(ip, r);
       return r;
@@ -215,23 +236,50 @@ async function lookupGeo(ip: string): Promise<GeoInfo> {
     return g;
   }
   const [base, ipmap] = await Promise.all([lookupIpApi(ip), lookupIpmap(ip)]);
+  const candidates: GeoCandidate[] = [];
+  if (ipmap && ipmap.strong) {
+    candidates.push({
+      source: "ipmap",
+      lat: ipmap.lat,
+      lon: ipmap.lon,
+      city: ipmap.city,
+      country: ipmap.country,
+      countryCode: ipmap.countryCode,
+      score: ipmap.score,
+      engines: ipmap.engines,
+    });
+  }
+  if (base.status === "ok" && base.lat != null && base.lon != null) {
+    candidates.push({
+      source: "ip-api",
+      lat: base.lat,
+      lon: base.lon,
+      city: base.city,
+      country: base.country,
+      countryCode: base.countryCode,
+    });
+  }
+  if (ipmap && !ipmap.strong && candidates.length === 0) {
+    // 根拠の弱い IPmap (人口ベースの当て推量) は最後の手段
+    candidates.push({ source: "ipmap", lat: ipmap.lat, lon: ipmap.lon, city: ipmap.city, country: ipmap.country, countryCode: ipmap.countryCode, score: ipmap.score, engines: ipmap.engines });
+  }
   let g: GeoInfo;
-  if (ipmap && (ipmap.strong || base.status !== "ok")) {
+  const primary = candidates[0];
+  if (primary) {
     g = {
       ...base,
       status: "ok",
       message: undefined,
-      lat: ipmap.lat,
-      lon: ipmap.lon,
-      city: ipmap.city ?? base.city,
-      country: ipmap.country ?? base.country,
-      countryCode: ipmap.countryCode ?? base.countryCode,
-      source: "ipmap",
-      geoScore: ipmap.score,
-      geoEngines: ipmap.engines,
+      lat: primary.lat,
+      lon: primary.lon,
+      city: primary.city ?? base.city,
+      country: primary.country ?? base.country,
+      countryCode: primary.countryCode ?? base.countryCode,
+      source: primary.source,
+      geoScore: primary.score,
+      geoEngines: primary.engines,
+      candidates,
     };
-  } else if (base.status === "ok") {
-    g = { ...base, source: "ip-api" };
   } else {
     g = base;
   }
@@ -496,6 +544,212 @@ function handleCables(req: IncomingMessage, res: ServerResponse): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// 陸上ファイバ (Open Fibre Data Standard 公開データ) の集約プロキシ
+// 27 ファイル・約22MB あるので、サーバ側で取得→間引き→1つの GeoJSON にまとめ、
+// メモリとディスク (node_modules/.cache) にキャッシュする
+// ---------------------------------------------------------------------------
+
+const OFDS_REPO = "Open-Telecoms-Data/OFDS-public-data";
+const FIBER_CACHE_FILE = path.join(
+  process.cwd(),
+  "node_modules/.cache/traceroute-globe/terrestrial-fiber.json",
+);
+const FIBER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+let fiberMemory: string | null = null;
+let fiberBuilding: Promise<string> | null = null;
+
+type LngLat = [number, number];
+
+/** Douglas–Peucker (反復版)。tol は度 (0.004° ≈ 400m) */
+function simplifyLine(coords: LngLat[], tol: number): LngLat[] {
+  if (coords.length <= 2) return coords;
+  const keep = new Uint8Array(coords.length);
+  keep[0] = 1;
+  keep[coords.length - 1] = 1;
+  const stack: [number, number][] = [[0, coords.length - 1]];
+  while (stack.length) {
+    const [s, e] = stack.pop()!;
+    const [x1, y1] = coords[s];
+    const [x2, y2] = coords[e];
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const norm = Math.hypot(dx, dy);
+    let maxD = 0;
+    let idx = -1;
+    for (let i = s + 1; i < e; i++) {
+      const [px, py] = coords[i];
+      const d =
+        norm === 0
+          ? Math.hypot(px - x1, py - y1)
+          : Math.abs(dy * px - dx * py + x2 * y1 - y2 * x1) / norm;
+      if (d > maxD) {
+        maxD = d;
+        idx = i;
+      }
+    }
+    if (idx >= 0 && maxD > tol) {
+      keep[idx] = 1;
+      stack.push([s, idx], [idx, e]);
+    }
+  }
+  return coords.filter((_, i) => keep[i] === 1);
+}
+
+async function buildTerrestrialFiber(): Promise<string> {
+  const treeRes = await fetch(`https://api.github.com/repos/${OFDS_REPO}/git/trees/HEAD?recursive=1`, {
+    headers: { "User-Agent": "traceroute-globe" },
+  });
+  if (!treeRes.ok) throw new Error(`GitHub tree HTTP ${treeRes.status}`);
+  const tree = (await treeRes.json()) as { tree: { path: string }[] };
+  const files = tree.tree.filter((t) => /ofds-spans.*\.geojson$/i.test(t.path));
+  const features: object[] = [];
+  const worker = async (file: { path: string }) => {
+    const [country, operator] = file.path.split("/");
+    const res = await fetch(`https://raw.githubusercontent.com/${OFDS_REPO}/HEAD/${file.path}`);
+    if (!res.ok) return;
+    const gj = (await res.json()) as { features?: Array<{ properties?: Record<string, unknown>; geometry?: { type: string; coordinates: unknown } }> };
+    for (const f of gj.features ?? []) {
+      const g = f.geometry;
+      if (!g) continue;
+      let lines: LngLat[][];
+      if (g.type === "LineString") lines = [g.coordinates as LngLat[]];
+      else if (g.type === "MultiLineString") lines = g.coordinates as LngLat[][];
+      else continue;
+      const simplified = lines
+        .map((line) =>
+          simplifyLine(
+            line.map((c) => [Math.round(c[0] * 1e4) / 1e4, Math.round(c[1] * 1e4) / 1e4] as LngLat),
+            0.004,
+          ),
+        )
+        .filter((line) => line.length >= 2);
+      if (simplified.length === 0) continue;
+      features.push({
+        type: "Feature",
+        properties: {
+          name: String(f.properties?.name ?? ""),
+          operator: operator.replace(/_/g, " "),
+          country: country.replace(/_/g, " "),
+          source: "OFDS",
+        },
+        geometry:
+          simplified.length === 1
+            ? { type: "LineString", coordinates: simplified[0] }
+            : { type: "MultiLineString", coordinates: simplified },
+      });
+    }
+  };
+  // 4 並列で取得
+  const queue = [...files];
+  await Promise.all(
+    Array.from({ length: 4 }, async () => {
+      for (let f = queue.shift(); f; f = queue.shift()) {
+        try {
+          await worker(f);
+        } catch (e) {
+          console.warn("[fiber] failed:", f.path, e instanceof Error ? e.message : e);
+        }
+      }
+    }),
+  );
+  const body = JSON.stringify({ type: "FeatureCollection", features });
+  try {
+    await fs.mkdir(path.dirname(FIBER_CACHE_FILE), { recursive: true });
+    await fs.writeFile(FIBER_CACHE_FILE, body);
+  } catch {
+    /* ディスクキャッシュは任意 */
+  }
+  return body;
+}
+
+async function handleFiber(_req: IncomingMessage, res: ServerResponse) {
+  try {
+    if (!fiberMemory) {
+      try {
+        const st = await fs.stat(FIBER_CACHE_FILE);
+        if (Date.now() - st.mtimeMs < FIBER_TTL_MS) {
+          fiberMemory = await fs.readFile(FIBER_CACHE_FILE, "utf8");
+        }
+      } catch {
+        /* キャッシュ無し */
+      }
+    }
+    if (!fiberMemory) {
+      fiberBuilding ??= buildTerrestrialFiber().finally(() => (fiberBuilding = null));
+      fiberMemory = await fiberBuilding;
+    }
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "max-age=3600" });
+    res.end(fiberMemory);
+  } catch (e) {
+    res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 道路ルーティング (OSRM 公開デモ) のプロキシ: 陸上区間の「道路沿い」推定線に使う。
+// デモサーバは軽い利用しか想定されていないので、直列 + 間隔を空けて呼ぶ
+// ---------------------------------------------------------------------------
+
+const routeCache = new Map<string, string>();
+let routeChain: Promise<void> = Promise.resolve();
+const ROUTE_MIN_INTERVAL_MS = 400;
+
+function parseLngLat(s: string | null): LngLat | null {
+  if (!s) return null;
+  const m = s.split(",").map(Number);
+  if (m.length !== 2 || !m.every(Number.isFinite)) return null;
+  if (Math.abs(m[0]) > 180 || Math.abs(m[1]) > 90) return null;
+  return [m[0], m[1]];
+}
+
+function handleRoute(req: IncomingMessage, res: ServerResponse) {
+  const url = new URL(req.url ?? "", "http://localhost");
+  const from = parseLngLat(url.searchParams.get("from"));
+  const to = parseLngLat(url.searchParams.get("to"));
+  if (!from || !to) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "from/to must be lng,lat" }));
+    return;
+  }
+  const key = `${from[0].toFixed(3)},${from[1].toFixed(3)}>${to[0].toFixed(3)},${to[1].toFixed(3)}`;
+  const cached = routeCache.get(key);
+  if (cached) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(cached);
+    return;
+  }
+  routeChain = routeChain.then(async () => {
+    try {
+      const r = await fetch(
+        `https://router.project-osrm.org/route/v1/driving/${from[0]},${from[1]};${to[0]},${to[1]}?overview=simplified&geometries=geojson`,
+        {
+          headers: { "User-Agent": "traceroute-globe (local dev tool)" },
+          signal: AbortSignal.timeout(15_000),
+        },
+      );
+      const j = (await r.json()) as {
+        code?: string;
+        routes?: Array<{ distance: number; geometry: { coordinates: LngLat[] } }>;
+      };
+      const route = j.code === "Ok" ? j.routes?.[0] : undefined;
+      const body = JSON.stringify(
+        route
+          ? { code: "Ok", distance: route.distance, coordinates: route.geometry.coordinates }
+          : { code: j.code ?? "Error", distance: null, coordinates: null },
+      );
+      routeCache.set(key, body);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(body);
+    } catch (e) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+    }
+    await new Promise((r) => setTimeout(r, ROUTE_MIN_INTERVAL_MS));
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Vite プラグイン
 // ---------------------------------------------------------------------------
 
@@ -509,6 +763,8 @@ export function tracerouteApi(): Plugin {
         if (path === "/api/enrich" && req.method === "POST") return void handleEnrich(req, res);
         if (path === "/api/self" && req.method === "GET") return void handleSelf(req, res);
         if (req.method === "GET" && handleCables(req, res)) return;
+        if (path === "/api/fiber" && req.method === "GET") return void handleFiber(req, res);
+        if (path === "/api/route" && req.method === "GET") return handleRoute(req, res);
         next();
       });
     },

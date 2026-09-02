@@ -287,6 +287,7 @@ interface LayerHandle {
 
 const CABLE_COLOR = "#2b5f8a";
 const CABLE_HI_COLOR = "#7ff3e6";
+const FIBER_COLOR = "#8a6a2b";
 
 export class Globe {
   private view!: ThreeView<DefaultDescriptions>;
@@ -301,6 +302,9 @@ export class Globe {
   private cableLayer: LayerHandle | null = null;
   private cableHiSource: SourceHandle | null = null;
   private cablesVisible = true;
+  private fiberSource: SourceHandle | null = null;
+  private fiberLayer: LayerHandle | null = null;
+  private fiberVisible = true;
   private cableChip: HTMLElement | null = null;
   private cableChipPos: { lat: number; lng: number } | null = null;
   private pickedCable: { id: string; name: string } | null = null;
@@ -427,6 +431,15 @@ export class Globe {
       selectiveBloom: { strength: 1.0, radius: 0.5, threshold: 0 },
     });
     this.bloomId = bloom.id;
+
+    // 陸上ファイバ (OFDS 公開データ)。公開地図からのデジタイズなので概略線
+    const fiberSource = view.addSource({ type: "geojson", data: emptyLineFC(), tiled: true });
+    this.fiberSource = fiberSource;
+    this.fiberLayer = view.addLayer({
+      type: "vector",
+      source: fiberSource,
+      polyline: { color: new Color().setStyle(FIBER_COLOR), width: 1, clampToGround: true },
+    });
 
     // 海底ケーブル (TeleGeography)。経路より下に描くため先に追加する。
     // 全体は控えめな色、推定で経路が通る候補は別レイヤーで発光させる
@@ -576,6 +589,9 @@ export class Globe {
       },
       {
         attributionHtml: `Submarine cables © <a href="https://www.submarinecablemap.com/">TeleGeography</a>`,
+      },
+      {
+        attributionHtml: `Terrestrial fibre: <a href="https://github.com/Open-Telecoms-Data/OFDS-public-data">OFDS public data</a>`,
       },
     ]);
 
@@ -749,6 +765,26 @@ export class Globe {
         width: 1,
         clampToGround: true,
         show: this.cablesVisible,
+      },
+    });
+  }
+
+  // ---- 陸上ファイバ ----
+
+  setFiber(geojson: object): void {
+    this.fiberSource?.update({ type: "geojson", data: geojson, tiled: true });
+  }
+
+  setFiberVisible(visible: boolean): void {
+    this.fiberVisible = visible;
+    this.fiberLayer?.update({
+      type: "vector",
+      source: this.fiberSource,
+      polyline: {
+        color: new Color().setStyle(FIBER_COLOR),
+        width: 1,
+        clampToGround: true,
+        show: this.fiberVisible,
       },
     });
   }

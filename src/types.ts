@@ -13,6 +13,19 @@ export interface GeoInfo {
   source?: "ipmap" | "ip-api";
   geoScore?: number;
   geoEngines?: string[];
+  /** 各ソースの候補位置。RTT の物理整合性で選び直す */
+  candidates?: GeoCandidate[];
+}
+
+export interface GeoCandidate {
+  source: "ipmap" | "ip-api";
+  lat: number;
+  lon: number;
+  city?: string;
+  country?: string;
+  countryCode?: string;
+  score?: number;
+  engines?: string[];
 }
 
 export interface Hop {

@@ -27,13 +27,24 @@ traceroute の経路を、[Navara](https://navara.world/)(Rust/WASM + Three.js �
   (英語・日本語) / `mtr --report` の出力をそのまま貼り付けて可視化
 - **履歴オーバーレイ** — 完了したトレースを localStorage に保存 (最大20件)。
   クリックで最大 4 本まで色分けして重ね描き
+- **崩れにくいルータ位置推定** — 各ホップを一般向け IP データベース (ip-api)
+  と [RIPE IPmap](https://ipmap.ripe.net/) (RIPE Atlas の遅延実測・IXP・
+  geofeed・クラウドソース) の両方で引き、クライアント側で実測 RTT と物理的に
+  整合する候補を選びます (光ファイバ中の光速 ≈ RTT 1ms あたり 100km。発信元
+  との距離と、隣接ホップとの RTT 差の両方で検証)。どの候補も説明できない
+  ホップは ⚠ 付きで地図から除外
 - **海底ケーブル** — 世界中の海底ケーブル (TeleGeography のデータ、約700
   システム) を経路の下に描画。ケーブルをクリックすると名前・長さ・RFS 年・
   所有者を表示
+- **陸上ファイバ** — Open Fibre Data Standard の公開データ (22 カ国) に
+  収録された長距離ファイバ経路を別レイヤーとして表示 (トグル可)。データの
+  無い陸上区間は、長距離ファイバが道路・鉄道沿いに敷設されることが多い
+  ことを踏まえて道路網 (OSRM) に沿って近似し、`🛣` 付きで「推定」と明示
 - **どのケーブルを通っているか** — 大陸間の区間ごとに、通っている可能性の
-  高いケーブルを推定 (両端ホップの近くに着陸点を持ち、その区間を跨ぐ
-  ケーブル)。ホップ一覧に候補を列挙し、最有力のものを地球儀上で発光表示。
-  traceroute では物理層は分からないので、あくまで「推定」として表示します
+  高いケーブルを推定 (両端ホップの近くに着陸点を持ち、その区間を跨ぎ、線形
+  の長さが実測の RTT 増分と整合するケーブル)。ホップ一覧に候補を列挙し、
+  最有力のものを地球儀上で発光表示、経路線もそのケーブルの敷設ルートに
+  沿わせます。traceroute では物理層は分からないので、あくまで「推定」です
 - **ズーム対応** — 俯瞰は NASA Black Marble、寄ると OSM ベースの詳細ダーク
   マップ (ストリートレベル) へ高度連動でクロスフェード。経路はタイルと同じ
   パイプラインで地表に描くので、どのズームでも線とマーカーが正確に繋がります
@@ -65,7 +76,9 @@ Vite が表示する URL (例: http://localhost:5173) を開く。
 | 色 | トレースごとの色スロット: シアン → オレンジ → バイオレット → グリーン |
 | 大きい点 | 宛先 |
 | 青い細線の網 | 世界の海底ケーブル (左パネルのトグルで表示/非表示) |
-| 発光する青緑のケーブル | 大陸間区間で推定されたケーブル (ホップ一覧の `🌊`) |
+| 琥珀色の細線 | OFDS 公開データの陸上ファイバ経路 (トグル可) |
+| 発光する青緑のケーブル | 大陸間区間で推定されたケーブル (ホップ一覧の `🌊`)。経路線はその線形に沿う |
+| 道路沿いの経路線 | 道路網で近似した陸上区間 (ホップ一覧の `🛣`) |
 
 近接ホップ (5km 未満) は 1 地点にまとめ、`8–9 Chiyoda City` のように TTL
 範囲で表示します。右パネルには全ホップ (IP / 逆引き / 都市 / ASN / RTT) が
@@ -79,10 +92,15 @@ Vite が表示する URL (例: http://localhost:5173) を開く。
   ├─ GET /api/trace    traceroute を spawn し、ホップ+ジオ+逆引きを SSE 配信
   ├─ POST /api/enrich  貼り付けモード用の一括ジオロケーション+逆引き
   ├─ GET /api/self     発信元 (自分のグローバル IP) の位置
-  └─ GET /api/cables   TeleGeography のケーブル GeoJSON / 詳細のプロキシ+キャッシュ
+  ├─ GET /api/cables   TeleGeography のケーブル GeoJSON / 詳細のプロキシ+キャッシュ
+  ├─ GET /api/fiber    OFDS の陸上ファイバ区間を取得・間引き・統合して配信
+  └─ GET /api/route    2点間の道路ルート (OSRM デモサーバ、直列化して呼び出し)
 サーバ側 (server/api.ts, Vite 開発サーバのミドルウェア)
-  └─ ジオロケーションは ip-api.com /batch (15req/分制限に合わせて
-     スロットル+マイクロバッチ+キャッシュ)
+  ├─ ジオロケーション: ip-api.com /batch (ASN。15req/分制限に合わせてスロットル)
+  │  + RIPE IPmap を IP ごとに (位置。4並列)、どちらもキャッシュ。候補を
+  │  すべてクライアントへ渡し、RTT との整合で選び直す
+  └─ 陸上ファイバ: OFDS の GeoJSON 27 ファイル (約22MB) を Douglas–Peucker で
+     1MB 未満に間引き、ディスクに1週間キャッシュ
 ```
 
 Navara 側は、高度連動でクロスフェードする Black Marble + OSM ダークスタイル、
@@ -118,6 +136,9 @@ clampToGround の GeoJSON ポリラインによる経路とケーブル (経路�
   ダークスタイル (© OpenStreetMap contributors)
 - IP ジオロケーション: [ip-api.com](https://ip-api.com)
 - 海底ケーブルの経路と詳細: [TeleGeography Submarine Cable Map](https://www.submarinecablemap.com/)
+- ルータ位置推定: [RIPE IPmap](https://ipmap.ripe.net/) (RIPE NCC)
+- 陸上ファイバ: [OFDS public data](https://github.com/Open-Telecoms-Data/OFDS-public-data) (Open Telecoms Data)
+- 陸上区間の道路ルーティング: [OSRM](http://project-osrm.org/) デモサーバ, © OpenStreetMap contributors
 
 ## ライセンス
 

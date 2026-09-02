@@ -271,27 +271,108 @@ function geoText(geo: GeoInfo | undefined): string {
   return `${flagEmoji(geo.countryCode)} ${place}${asn}${src}`;
 }
 
+/** 光ファイバの往復 ≈ 10ms / 1000km → RTT 1ms あたり最大 100km */
+const KM_PER_MS = 100;
+/** RTT のジッタ許容 (ms)。バックボーンでも数十 ms 揺れるので大きめに取る */
+const RTT_SLACK_MS = 15;
+
 /**
- * 光速制約による位置の検証: 往復 RTT が r ms なら発信元からの距離は
- * 高々 約100km × r (光ファイバ中 ≈ 200,000km/s の往復)。それを大きく超える
- * 推定位置は誤りとみなして地図から外す (一覧には ⚠ 付きで残す)
+ * 位置候補 (IPmap / ip-api) を RTT の物理整合性で選び直す。
+ * - 発信元が分かるライブトレース: 発信元からの距離 ≤ 100km × RTT
+ * - それに加えて、RTT 差が最も小さい隣接ホップ (位置既知) との距離 ≤ 100km × (|ΔRTT| + 15)
+ * どの候補も通らなければ一次候補を残しつつ地図から除外 (⚠)
  */
-function applyRttSanity(t: Trace): void {
+function resolveGeo(t: Trace): void {
   const o = t.useOrigin && origin?.geo.status === "ok" ? origin.geo : null;
-  for (const hop of t.hops.values()) {
+  const hops = sortedHops(t);
+  // 隣接判定の基準には各ホップの一次候補 (サーバが選んだもの) を使う
+  const primaryOf = (h: Hop) => {
+    const g = h.geo;
+    if (!g || g.status !== "ok") return null;
+    const c = g.candidates?.[0];
+    return c ?? (g.lat != null && g.lon != null ? { lat: g.lat, lon: g.lon } : null);
+  };
+  for (let i = 0; i < hops.length; i++) {
+    const hop = hops[i];
     hop.geoSuspect = false;
-    if (!o || o.lat == null || o.lon == null) continue;
     const g = hop.geo;
-    if (!g || g.status !== "ok" || g.lat == null || g.lon == null || hop.rtt == null) continue;
-    const dist = haversine(o.lat, o.lon, g.lat, g.lon);
-    const maxDist = hop.rtt * 100_000 * 1.15 + 50_000;
-    if (dist > maxDist) hop.geoSuspect = true;
+    if (!g || g.status !== "ok" || hop.rtt == null) continue;
+    const candidates = g.candidates?.length
+      ? g.candidates
+      : g.lat != null && g.lon != null
+        ? [{ source: g.source ?? "ip-api", lat: g.lat, lon: g.lon, city: g.city, country: g.country, countryCode: g.countryCode }]
+        : [];
+    if (candidates.length === 0) continue;
+
+    // 基準となる隣接ホップ: RTT 差が最小の、位置が分かっているホップ
+    let ref: { lat: number; lon: number; dRtt: number } | null = null;
+    for (const dir of [-1, 1]) {
+      for (let j = i + dir; j >= 0 && j < hops.length; j += dir) {
+        const other = hops[j];
+        if (other.rtt == null) continue;
+        const p = primaryOf(other);
+        if (!p) continue;
+        const dRtt = Math.abs(hop.rtt - other.rtt);
+        if (!ref || dRtt < ref.dRtt) ref = { lat: p.lat, lon: p.lon, dRtt };
+        break;
+      }
+    }
+
+    const plausible = (c: { lat: number; lon: number }) => {
+      if (o && o.lat != null && o.lon != null) {
+        if (haversine(o.lat, o.lon, c.lat, c.lon) > hop.rtt! * KM_PER_MS * 1_000 * 1.15 + 50_000) return false;
+      }
+      if (ref) {
+        if (haversine(ref.lat, ref.lon, c.lat, c.lon) > (ref.dRtt + RTT_SLACK_MS) * KM_PER_MS * 1_000) return false;
+      }
+      return true;
+    };
+
+    const chosen = candidates.find(plausible);
+    const pick = chosen ?? candidates[0];
+    g.lat = pick.lat;
+    g.lon = pick.lon;
+    g.city = pick.city ?? g.city;
+    g.country = pick.country ?? g.country;
+    g.countryCode = pick.countryCode ?? g.countryCode;
+    g.source = pick.source;
+    g.geoScore = pick.score;
+    g.geoEngines = pick.engines;
+    if (!chosen) hop.geoSuspect = true;
   }
 }
 
 function chainOf(t: Trace): ChainNode[] {
-  applyRttSanity(t);
+  resolveGeo(t);
   return buildChain(sortedHops(t), t.useOrigin ? origin : null, t.targetIp);
+}
+
+/** ノードの最小 RTT (ms)。発信元は 0、RTT の無いノードは null */
+function nodeMinRtt(n: ChainNode): number | null {
+  if (n.isOrigin && n.hops.length === 0) return 0;
+  let m: number | null = null;
+  for (const h of n.hops) {
+    if (h.rtt != null && (m == null || h.rtt < m)) m = h.rtt;
+  }
+  return m;
+}
+
+/** 区間の推定キー (RTT 差も含めて、順位付けが変わる条件ごとにキャッシュ) */
+function legKey(a: ChainNode, b: ChainNode): { key: string; rttDelta: number | null } {
+  const ra = nodeMinRtt(a);
+  const rb = nodeMinRtt(b);
+  const rttDelta = ra != null && rb != null ? rb - ra : null;
+  return { key: `${a.key}>${b.key}:${rttDelta == null ? "-" : Math.round(rttDelta)}`, rttDelta };
+}
+
+function candidatesFor(a: ChainNode, b: ChainNode): CableCandidate[] {
+  const { key, rttDelta } = legKey(a, b);
+  let cands = cableInferCache.get(key);
+  if (!cands) {
+    cands = inferCables(a, b, cables, rttDelta);
+    cableInferCache.set(key, cands);
+  }
+  return cands;
 }
 
 /** 各区間の海底ケーブル推定。キーは区間の終点ノードの先頭ホップ TTL */
@@ -300,52 +381,110 @@ function legCableCandidates(t: Trace): Map<number, CableCandidate[]> {
   if (cables.length === 0) return map;
   const nodes = chainOf(t);
   for (let i = 0; i + 1 < nodes.length; i++) {
-    const a = nodes[i];
-    const b = nodes[i + 1];
-    const key = `${a.key}>${b.key}`;
-    let cands = cableInferCache.get(key);
-    if (!cands) {
-      cands = inferCables(a, b, cables);
-      cableInferCache.set(key, cands);
-    }
-    const firstHop = b.hops[0];
+    const cands = candidatesFor(nodes[i], nodes[i + 1]);
+    const firstHop = nodes[i + 1].hops[0];
     if (cands.length > 0 && firstHop) map.set(firstHop.ttl, cands);
   }
   return map;
 }
 
-/**
- * 推定ケーブルがある区間の線形: ホップ → (大円) → 着陸点 → ケーブルの実際の
- * 敷設ルート → 着陸点 → (大円) → ホップ。地表線をこの形で描く
- */
-function legPathsFor(t: Trace): Map<string, [number, number][]> {
-  const map = new Map<string, [number, number][]>();
-  if (cables.length === 0) return map;
+// ---- 陸上区間の道路沿い推定 (OSRM) ----
+// 長距離ファイバは道路・鉄道沿いに敷設されることが多い (InterTubes, SIGCOMM 2015)
+// ので、海底ケーブルに該当しない陸上区間は道路ルートで近似する
+
+interface RoadPath {
+  coords: [number, number][];
+  distance: number; // m
+}
+const roadPathCache = new Map<string, RoadPath | null | "pending">();
+
+function isTerrestrialLeg(a: ChainNode, b: ChainNode, len: number): boolean {
+  if (len < 80_000 || len > 3_000_000) return false;
+  const sameCountry = !!a.countryCode && a.countryCode === b.countryCode;
+  return sameCountry || len < 1_500_000;
+}
+
+function requestRoadPath(a: ChainNode, b: ChainNode, len: number): void {
+  const key = `${a.key}>${b.key}`;
+  if (roadPathCache.has(key)) return;
+  roadPathCache.set(key, "pending");
+  const q = new URLSearchParams({ from: `${a.lng},${a.lat}`, to: `${b.lng},${b.lat}` });
+  void fetch(`/api/route?${q}`)
+    .then((r) => r.json())
+    .then((j: { code?: string; distance?: number | null; coordinates?: [number, number][] | null }) => {
+      let val: RoadPath | null = null;
+      // 大きく迂回するルート (海を回り込む等) は道路沿いとはみなさない
+      if (
+        j.code === "Ok" &&
+        Array.isArray(j.coordinates) &&
+        j.coordinates.length >= 2 &&
+        typeof j.distance === "number" &&
+        j.distance <= len * 2.2
+      ) {
+        val = { coords: j.coordinates, distance: j.distance };
+      }
+      roadPathCache.set(key, val);
+      if (val && traces.size > 0) {
+        renderAll();
+        updateGlobe();
+      }
+    })
+    .catch(() => roadPathCache.set(key, null));
+}
+
+/** 道路沿い推定を適用した区間: 終点ノードの先頭ホップ TTL → 道路距離 (km) */
+function legRoadInfo(t: Trace): Map<number, number> {
+  const map = new Map<number, number>();
   const nodes = chainOf(t);
   for (let i = 0; i + 1 < nodes.length; i++) {
     const a = nodes[i];
     const b = nodes[i + 1];
-    const key = `${a.key}>${b.key}`;
-    let path = legPathCache.get(key);
-    if (path === undefined) {
-      path = null;
-      let cands = cableInferCache.get(key);
-      if (!cands) {
-        cands = inferCables(a, b, cables);
-        cableInferCache.set(key, cands);
+    if (legPathCache.get(legKey(a, b).key)) continue; // ケーブル線形が優先
+    const road = roadPathCache.get(`${a.key}>${b.key}`);
+    const firstHop = b.hops[0];
+    if (road && road !== "pending" && firstHop) map.set(firstHop.ttl, road.distance / 1000);
+  }
+  return map;
+}
+
+/**
+ * 区間ごとの線形の上書き。
+ * - 推定ケーブルがある区間: ホップ → (大円) → 着陸点 → ケーブルの敷設ルート → 着陸点 → (大円) → ホップ
+ * - 陸上区間: 道路ルート (取得できるまでは大円)
+ */
+function legPathsFor(t: Trace): Map<string, [number, number][]> {
+  const map = new Map<string, [number, number][]>();
+  const nodes = chainOf(t);
+  for (let i = 0; i + 1 < nodes.length; i++) {
+    const a = nodes[i];
+    const b = nodes[i + 1];
+    const chainKey = `${a.key}>${b.key}`;
+    const len = haversine(a.lat, a.lng, b.lat, b.lng);
+    let path: [number, number][] | null = null;
+    if (cables.length > 0) {
+      const { key } = legKey(a, b);
+      const cached = legPathCache.get(key);
+      if (cached !== undefined) {
+        path = cached;
+      } else {
+        const best = candidatesFor(a, b)[0];
+        const core = best ? cablePath(best.cable, a, b) : null;
+        if (core) {
+          const start = { lng: core[0][0], lat: core[0][1] };
+          const end = { lng: core[core.length - 1][0], lat: core[core.length - 1][1] };
+          const lead = greatCirclePoints(a, start, haversine(a.lat, a.lng, start.lat, start.lng));
+          const tail = greatCirclePoints(end, b, haversine(end.lat, end.lng, b.lat, b.lng));
+          path = [...lead, ...core.slice(1), ...tail.slice(1)];
+        }
+        legPathCache.set(key, path);
       }
-      const best = cands[0];
-      const core = best ? cablePath(best.cable, a, b) : null;
-      if (core) {
-        const start = { lng: core[0][0], lat: core[0][1] };
-        const end = { lng: core[core.length - 1][0], lat: core[core.length - 1][1] };
-        const lead = greatCirclePoints(a, start, haversine(a.lat, a.lng, start.lat, start.lng));
-        const tail = greatCirclePoints(end, b, haversine(end.lat, end.lng, b.lat, b.lng));
-        path = [...lead, ...core.slice(1), ...tail.slice(1)];
-      }
-      legPathCache.set(key, path);
     }
-    if (path) map.set(key, path);
+    if (!path && isTerrestrialLeg(a, b, len)) {
+      const road = roadPathCache.get(chainKey);
+      if (road === undefined) requestRoadPath(a, b, len);
+      else if (road && road !== "pending") path = road.coords;
+    }
+    if (path) map.set(chainKey, path);
   }
   return map;
 }
@@ -371,7 +510,12 @@ function statsText(t: Trace, nodes: ChainNode[]): string {
   return parts.join(" · ");
 }
 
-function buildHopRow(t: Trace, hop: Hop, cableCands?: CableCandidate[]): HTMLLIElement {
+function buildHopRow(
+  t: Trace,
+  hop: Hop,
+  cableCands?: CableCandidate[],
+  roadKm?: number,
+): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "hop";
   const ttl = document.createElement("span");
@@ -416,7 +560,9 @@ function buildHopRow(t: Trace, hop: Hop, cableCands?: CableCandidate[]): HTMLLIE
         b.type = "button";
         b.className = "cable-name" + (i === 0 ? " best" : "");
         b.textContent = c.cable.name;
-        b.title = `着陸点までの距離: ${Math.round(c.landingA / 1000)} km / ${Math.round(c.landingB / 1000)} km`;
+        b.title =
+          `着陸点までの距離: ${Math.round(c.landingA / 1000)} km / ${Math.round(c.landingB / 1000)} km` +
+          ` · 線形 ${Math.round(c.pathLen / 1000).toLocaleString("ja-JP")} km (RTT 期待値 +${c.expectedMs.toFixed(0)} ms)`;
         b.addEventListener("click", (e) => {
           e.stopPropagation();
           globe.setCableHighlights(c.cable.features);
@@ -425,6 +571,12 @@ function buildHopRow(t: Trace, hop: Hop, cableCands?: CableCandidate[]): HTMLLIE
         hint.append(b);
       });
       main.append(hint);
+    }
+    if (roadKm != null) {
+      const road = document.createElement("div");
+      road.className = "road-hint";
+      road.textContent = `🛣 陸上区間: 道路沿いで推定 (${Math.round(roadKm).toLocaleString("ja-JP")} km)`;
+      main.append(road);
     }
     if (hop.geo?.status === "ok" && !hop.geoSuspect) {
       li.classList.add("clickable");
@@ -489,7 +641,10 @@ function renderHopPanel() {
     const ol = document.createElement("ol");
     ol.className = "hop-list";
     const cands = legCableCandidates(t);
-    for (const hop of sortedHops(t)) ol.append(buildHopRow(t, hop, cands.get(hop.ttl)));
+    const roads = legRoadInfo(t);
+    for (const hop of sortedHops(t)) {
+      ol.append(buildHopRow(t, hop, cands.get(hop.ttl), roads.get(hop.ttl)));
+    }
     sec.append(ol);
     hopSections.append(sec);
   }
@@ -1010,6 +1165,22 @@ async function boot() {
       })
       .catch(() => {});
   });
+  // 陸上ファイバ (OFDS): 初回はサーバ側で集約に時間がかかる
+  const fiberToggle = $<HTMLInputElement>("#fiber-toggle");
+  const fiberStatus = $("#fiber-status");
+  fiberToggle.addEventListener("change", () => globe.setFiberVisible(fiberToggle.checked));
+  void fetch("/api/fiber")
+    .then(async (r) => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const gj = (await r.json()) as { features: unknown[] };
+      globe.setFiber(gj);
+      fiberStatus.textContent = `${gj.features.length.toLocaleString("ja-JP")} 区間 (OFDS)`;
+    })
+    .catch((e: unknown) => {
+      fiberStatus.textContent = "取得できませんでした";
+      console.warn("terrestrial fiber:", e);
+    });
+
   void loadCables()
     .then(({ geojson, cables: list }) => {
       cables = list;
