@@ -9,8 +9,8 @@ export interface GeoInfo {
   org?: string;
   as?: string;
   message?: string;
-  /** 位置の出どころ。ipmap = RIPE IPmap (遅延実測・逆引き等)、ip-api = 一般IPデータベース */
-  source?: "ipmap" | "ip-api";
+  /** 位置の出どころ。hostname = 逆引きホスト名の地名コード、ipmap = RIPE IPmap、ip-api = 一般IPデータベース */
+  source?: "hostname" | "ipmap" | "ip-api";
   geoScore?: number;
   geoEngines?: string[];
   /** 各ソースの候補位置。RTT の物理整合性で選び直す */
@@ -18,7 +18,7 @@ export interface GeoInfo {
 }
 
 export interface GeoCandidate {
-  source: "ipmap" | "ip-api";
+  source: "hostname" | "ipmap" | "ip-api";
   lat: number;
   lon: number;
   city?: string;

@@ -37,6 +37,8 @@ export interface CableCandidate {
   pathLen: number;
   /** 線形長から期待される RTT 増分 (ms, 往復 10ms/1000km) */
   expectedMs: number;
+  /** 経路が実際に通る部分のケーブル線形 (着陸点→着陸点)。辿れなければ null */
+  corePath: LngLat[] | null;
 }
 
 export interface CableDetail {
@@ -233,8 +235,9 @@ export function inferCables(
 ): CableCandidate[] {
   const legLen = haversine(a.lat, a.lng, b.lat, b.lng);
   if (legLen < MIN_LEG_M) return [];
-  // 同一国内の区間は 1,500km 未満なら陸上伝送とみなす (本土〜離島などは対象に残す)
-  if (a.countryCode && a.countryCode === b.countryCode && legLen < 1_500_000) return [];
+  // 同一国内の区間は陸上伝送とみなす (シアトル→LA のような長い国内区間が
+  // 太平洋ケーブルに吸い寄せられるのを防ぐ。本土〜離島は今後の課題)
+  if (a.countryCode && a.countryCode === b.countryCode) return [];
 
   const out: CableCandidate[] = [];
   for (const c of cables) {
@@ -259,7 +262,10 @@ export function inferCables(
     const span = haversine(endA.lat, endA.lng, endB.lat, endB.lng);
     if (span < legLen * 0.4) continue;
     // 線形が辿れればその長さ、無理なら着陸点間の直線 + 陸上スタブ
-    const path = cablePath(c, a, b);
+    let path = cablePath(c, a, b);
+    // ケーブルのグラフ最短路が別の分岐を大回りする (直線の 1.6 倍超) なら、
+    // その線形は「この区間の経路」ではないので使わない
+    if (path && pathLength(path) > legLen * 1.6) path = null;
     const pathLen = (path ? pathLength(path) : span) + bestA + bestB;
     // 光ファイバの往復 ≈ 10ms / 1000km
     const expectedMs = pathLen / 100_000;
@@ -268,7 +274,7 @@ export function inferCables(
     if (rttDeltaMs != null && rttDeltaMs > 0) {
       score += Math.abs(rttDeltaMs - expectedMs) * 100_000;
     }
-    out.push({ cable: c, landingA: bestA, landingB: bestB, score, pathLen, expectedMs });
+    out.push({ cable: c, landingA: bestA, landingB: bestB, score, pathLen, expectedMs, corePath: path });
   }
   out.sort((x, y) => x.score - y.score);
   return out.slice(0, 3);

@@ -12,14 +12,13 @@ import {
   type OriginInfo,
 } from "./globe";
 import {
-  cablePath,
   fetchCableDetail,
   inferCables,
   loadCables,
   type CableCandidate,
-  type CableFeature,
   type CableInfo,
 } from "./cables";
+import { hostnameLocation } from "./hostname-geo";
 import { parseTraceText } from "./parse";
 import { enrichIps, startTrace, type TraceHandle } from "./tracer";
 import type { GeoInfo, Hop, TraceRecord } from "./types";
@@ -267,7 +266,7 @@ function geoText(geo: GeoInfo | undefined): string {
   if (geo.status === "fail") return "位置情報なし";
   const place = [geo.city, geo.country].filter(Boolean).join(", ");
   const asn = geo.as ? ` · ${geo.as.split(" ")[0]}` : "";
-  const src = geo.source === "ipmap" ? " · IPmap" : "";
+  const src = geo.source === "ipmap" ? " · IPmap" : geo.source === "hostname" ? " · rDNS" : "";
   return `${flagEmoji(geo.countryCode)} ${place}${asn}${src}`;
 }
 
@@ -285,10 +284,13 @@ const RTT_SLACK_MS = 15;
 function resolveGeo(t: Trace): void {
   const o = t.useOrigin && origin?.geo.status === "ok" ? origin.geo : null;
   const hops = sortedHops(t);
-  // 隣接判定の基準には各ホップの一次候補 (サーバが選んだもの) を使う
+  // 隣接判定の基準には、そのホップで最も信頼できる候補 (ホスト名 > サーバの一次候補) を使う。
+  // 隣のホップの一次候補が誤っていると正しい候補まで弾いてしまう連鎖を避けるため
   const primaryOf = (h: Hop) => {
     const g = h.geo;
     if (!g || g.status !== "ok") return null;
+    const fromHost = hostnameLocation(h.hostname);
+    if (fromHost) return fromHost;
     const c = g.candidates?.[0];
     return c ?? (g.lat != null && g.lon != null ? { lat: g.lat, lon: g.lon } : null);
   };
@@ -297,11 +299,14 @@ function resolveGeo(t: Trace): void {
     hop.geoSuspect = false;
     const g = hop.geo;
     if (!g || g.status !== "ok" || hop.rtt == null) continue;
-    const candidates = g.candidates?.length
+    const serverCandidates = g.candidates?.length
       ? g.candidates
       : g.lat != null && g.lon != null
         ? [{ source: g.source ?? "ip-api", lat: g.lat, lon: g.lon, city: g.city, country: g.country, countryCode: g.countryCode }]
         : [];
+    // 逆引きホスト名の地名コード (sttlwa, chcgil, lax ...) は事業者自身の命名なので最優先
+    const fromHost = hostnameLocation(hop.hostname);
+    const candidates = fromHost ? [fromHost, ...serverCandidates] : serverCandidates;
     if (candidates.length === 0) continue;
 
     // 基準となる隣接ホップ: RTT 差が最小の、位置が分かっているホップ
@@ -399,9 +404,11 @@ interface RoadPath {
 const roadPathCache = new Map<string, RoadPath | null | "pending">();
 
 function isTerrestrialLeg(a: ChainNode, b: ChainNode, len: number): boolean {
-  if (len < 80_000 || len > 3_000_000) return false;
+  if (len < 80_000) return false;
   const sameCountry = !!a.countryCode && a.countryCode === b.countryCode;
-  return sameCountry || len < 1_500_000;
+  // 国内は大陸横断 (米国東西 ≈ 4,000km) まで道路で辿る。国境を跨ぐ区間は
+  // 近距離だけ (それ以上は海を跨ぐ可能性が高く、ケーブル推定か大円に任せる)
+  return sameCountry ? len <= 6_000_000 : len < 1_500_000;
 }
 
 function requestRoadPath(a: ChainNode, b: ChainNode, len: number): void {
@@ -468,7 +475,7 @@ function legPathsFor(t: Trace): Map<string, [number, number][]> {
         path = cached;
       } else {
         const best = candidatesFor(a, b)[0];
-        const core = best ? cablePath(best.cable, a, b) : null;
+        const core = best?.corePath ?? null;
         if (core) {
           const start = { lng: core[0][0], lat: core[0][1] };
           const end = { lng: core[core.length - 1][0], lat: core[core.length - 1][1] };
@@ -565,6 +572,7 @@ function buildHopRow(
           ` · 線形 ${Math.round(c.pathLen / 1000).toLocaleString("ja-JP")} km (RTT 期待値 +${c.expectedMs.toFixed(0)} ms)`;
         b.addEventListener("click", (e) => {
           e.stopPropagation();
+          // 候補名クリック時だけはシステム全体を光らせて全体像を見せる
           globe.setCableHighlights(c.cable.features);
           globe.flyToCable(c.cable);
         });
@@ -837,15 +845,19 @@ function currentChains(): ChainLayer[] {
 function updateGlobe(followId?: string) {
   const chains = currentChains();
   globe.setChains(chains);
-  // 各区間の最有力ケーブルを発光表示
-  const hi: CableFeature[] = [];
-  const seen = new Set<string>();
+  // 各区間の最有力ケーブルのうち、経路が実際に通る部分だけを発光表示
+  // (システム全体を光らせると分岐がすべて光って経路と見分けがつかなくなる)
+  const hi: object[] = [];
   for (const t of traces.values()) {
     for (const list of legCableCandidates(t).values()) {
       const best = list[0];
-      if (best && !seen.has(best.cable.id)) {
-        seen.add(best.cable.id);
-        hi.push(...best.cable.features);
+      if (!best) continue;
+      if (best.corePath) {
+        hi.push({
+          type: "Feature",
+          properties: { id: best.cable.id, name: best.cable.name },
+          geometry: { type: "LineString", coordinates: best.corePath },
+        });
       }
     }
   }
