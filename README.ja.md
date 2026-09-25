@@ -70,6 +70,29 @@ Vite が表示する URL (例: http://localhost:5173) を開く。
   [docs/demo-v6.txt](docs/demo-v6.txt) / [docs/demo-v4.txt](docs/demo-v4.txt)
   (ftp.funet.fi への実トレースから公開ホップのみ抜き出したもの) をどうぞ
 
+### 検証網やデモ網を表示する (固定位置)
+
+プライベートアドレスや自前の検証網は IP データベースで位置が引けないため、そのままでは地図に載りません。
+アドレスごとの位置を JSON に書いて環境変数 `TRACEROUTE_GLOBE_GEO` で渡すと、その位置とホスト名で描きます
+(書いた位置は正解として扱い、RTT との矛盾判定でも外しません)。`self` を書くと発信元もその位置になります。
+
+```json
+{
+  "self": { "lat": 35.68, "lon": 139.77, "city": "Tokyo", "countryCode": "JP" },
+  "hosts": {
+    "10.0.12.2": { "lat": 1.35, "lon": 103.82, "city": "Singapore", "country": "Singapore",
+                   "countryCode": "SG", "hostname": "r2.lab" }
+  }
+}
+```
+
+```sh
+TRACEROUTE_GLOBE_GEO=./lab-geo.json npm run dev
+```
+
+URL に `?host=10.0.12.2&wait=5` を付けると、宛先が入った状態で開きます。`wait` は 1 ホップあたりの応答待ち
+(秒。既定 2、上限 5) です。往復が 1 秒を超えるような経路では、延ばさないと末尾のホップが `*` になります。
+
 ## 表示の読み方
 
 | 要素 | 意味 |

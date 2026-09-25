@@ -5,6 +5,8 @@ export interface TraceOptions {
   v6: boolean;
   proto: "icmp" | "udp";
   maxhops?: number;
+  /** 1 ホップの応答待ち (秒)。サーバ既定は 2、上限 5 */
+  wait?: number;
 }
 
 export interface TraceHandle {
@@ -21,6 +23,7 @@ export function startTrace(
     proto: opts.proto,
     maxhops: String(opts.maxhops ?? 30),
   });
+  if (opts.wait) params.set("wait", String(opts.wait));
   const es = new EventSource(`/api/trace?${params}`);
   es.onmessage = (e) => {
     let ev: TraceEvent;

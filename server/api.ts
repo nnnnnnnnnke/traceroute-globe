@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { promises as dns } from "node:dns";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
 import type { Plugin } from "vite";
@@ -20,8 +20,9 @@ export interface GeoInfo {
   org?: string;
   as?: string;
   message?: string;
-  /** 位置の出どころ。ipmap = RIPE IPmap (遅延実測・逆引き等)、ip-api = 一般IPデータベース */
-  source?: "ipmap" | "ip-api";
+  /** 位置の出どころ。ipmap = RIPE IPmap (遅延実測・逆引き等)、ip-api = 一般IPデータベース、
+   *  static = TRACEROUTE_GLOBE_GEO で与えた固定位置 */
+  source?: "ipmap" | "ip-api" | "static";
   geoScore?: number;
   geoEngines?: string[];
   /** 各ソースの候補位置。クライアントが RTT の物理整合性で選び直す */
@@ -29,7 +30,7 @@ export interface GeoInfo {
 }
 
 export interface GeoCandidate {
-  source: "ipmap" | "ip-api";
+  source: "ipmap" | "ip-api" | "static";
   lat: number;
   lon: number;
   city?: string;
@@ -70,6 +71,69 @@ function isPrivateIp(ip: string): boolean {
     (a === 172 && b >= 16 && b <= 31) ||
     (a === 192 && b === 168)
   );
+}
+
+// ---------------------------------------------------------------------------
+// 固定位置 (ラボ・デモ網など、DB では位置が引けないアドレス用)
+// TRACEROUTE_GLOBE_GEO に JSON のパスを渡すと、書いたアドレスはその位置・ホスト名で表示する。
+// { "self": { lat, lon, city, country, countryCode },
+//   "hosts": { "10.0.0.1": { lat, lon, city, country, countryCode, hostname, org, as } } }
+// ---------------------------------------------------------------------------
+
+interface StaticPlace {
+  lat: number;
+  lon: number;
+  city?: string;
+  country?: string;
+  countryCode?: string;
+  hostname?: string;
+  org?: string;
+  as?: string;
+}
+
+function validPlace(p: unknown): p is StaticPlace {
+  const q = p as StaticPlace | null;
+  return (
+    q != null &&
+    typeof q.lat === "number" &&
+    typeof q.lon === "number" &&
+    Math.abs(q.lat) <= 90 &&
+    Math.abs(q.lon) <= 180
+  );
+}
+
+function loadStaticGeo(): { self?: StaticPlace; hosts: Map<string, StaticPlace> } {
+  const hosts = new Map<string, StaticPlace>();
+  const file = process.env.TRACEROUTE_GLOBE_GEO;
+  if (!file) return { hosts };
+  try {
+    const data = JSON.parse(readFileSync(file, "utf8")) as { self?: unknown; hosts?: Record<string, unknown> };
+    for (const [ip, p] of Object.entries(data.hosts ?? {})) {
+      if (validPlace(p)) hosts.set(ip.toLowerCase(), p);
+      else console.warn(`[traceroute-globe] 固定位置 ${ip} は lat/lon が不正なので無視します`);
+    }
+    const self = validPlace(data.self) ? data.self : undefined;
+    console.log(`[traceroute-globe] 固定位置 ${hosts.size} 件${self ? " + 発信元" : ""}: ${file}`);
+    return { self, hosts };
+  } catch (e) {
+    console.warn(`[traceroute-globe] 固定位置ファイルを読めません (${file}): ${e instanceof Error ? e.message : e}`);
+    return { hosts };
+  }
+}
+
+const staticGeo = loadStaticGeo();
+
+function staticGeoInfo(p: StaticPlace): GeoInfo {
+  const place = { lat: p.lat, lon: p.lon, city: p.city, country: p.country, countryCode: p.countryCode };
+  return {
+    status: "ok",
+    ...place,
+    isp: p.org,
+    org: p.org,
+    as: p.as,
+    source: "static",
+    candidates: [{ source: "static", ...place }],
+  };
 }
 
 // ip-api.com の /batch は 15req/分 制限 (超過で 429 → 1時間 ban もあり得る)。
@@ -228,6 +292,8 @@ async function lookupIpmap(ip: string): Promise<IpmapLocation | null> {
 
 /** ip-api (ASN・ISP) と IPmap (位置) を合成する */
 async function lookupGeo(ip: string): Promise<GeoInfo> {
+  const fixed = staticGeo.hosts.get(ip.toLowerCase());
+  if (fixed) return staticGeoInfo(fixed);
   const cached = geoCache.get(ip);
   if (cached) return cached;
   if (isPrivateIp(ip)) {
@@ -295,6 +361,8 @@ async function lookupGeo(ip: string): Promise<GeoInfo> {
 const rdnsCache = new Map<string, string | null>();
 
 async function lookupRdns(ip: string): Promise<string | null> {
+  const fixed = staticGeo.hosts.get(ip.toLowerCase())?.hostname;
+  if (fixed) return fixed;
   if (rdnsCache.has(ip)) return rdnsCache.get(ip)!;
   try {
     const names = await Promise.race([
@@ -472,6 +540,12 @@ async function handleEnrich(req: IncomingMessage, res: ServerResponse) {
 let selfCache: { at: number; body: string } | null = null;
 
 async function handleSelf(_req: IncomingMessage, res: ServerResponse) {
+  if (staticGeo.self) {
+    const { lat, lon, city, country, countryCode, org, as } = staticGeo.self;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "success", lat, lon, city, country, countryCode, isp: org, org, as }));
+    return;
+  }
   if (selfCache && Date.now() - selfCache.at < 10 * 60 * 1000) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(selfCache.body);

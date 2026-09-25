@@ -209,6 +209,11 @@ const PRESETS = [
   }
 }
 
+// URL で宛先と応答待ちを渡せる (例: ?host=10.0.0.1&wait=5)。遅い経路では wait を延ばさないと末尾が * になる
+const urlParams = new URLSearchParams(location.search);
+if (urlParams.get("host")) hostInput.value = urlParams.get("host")!;
+const urlWait = Number(urlParams.get("wait")) || undefined;
+
 // ---------------------------------------------------------------------------
 // 描画
 // ---------------------------------------------------------------------------
@@ -269,7 +274,8 @@ function geoText(geo: GeoInfo | undefined): string {
   if (geo.status === "fail") return "位置情報なし";
   const place = [geo.city, geo.country].filter(Boolean).join(", ");
   const asn = geo.as ? ` · ${geo.as.split(" ")[0]}` : "";
-  const src = geo.source === "ipmap" ? " · IPmap" : geo.source === "hostname" ? " · rDNS" : "";
+  const src =
+    geo.source === "ipmap" ? " · IPmap" : geo.source === "hostname" ? " · rDNS" : geo.source === "static" ? " · 固定" : "";
   return `${flagEmoji(geo.countryCode)} ${place}${asn}${src}`;
 }
 
@@ -307,6 +313,9 @@ function resolveGeo(t: Trace): void {
       : g.lat != null && g.lon != null
         ? [{ source: g.source ?? "ip-api", lat: g.lat, lon: g.lon, city: g.city, country: g.country, countryCode: g.countryCode }]
         : [];
+    // 固定位置 (TRACEROUTE_GLOBE_GEO) は利用者が与えた正解なので、ほかの候補と混ぜない
+    const fixed = server.filter((c) => c.source === "static");
+    if (fixed.length) return fixed;
     // 逆引きホスト名の地名コード (sttlwa, chcgil, lax ...) は事業者自身の命名なので最優先
     const fromHost = hostnameLocation(h.hostname);
     return fromHost ? [fromHost, ...server] : server;
@@ -322,7 +331,8 @@ function resolveGeo(t: Trace): void {
   // ソースの信頼順: ホスト名 (事業者自身の命名) > IPmap (実測) > ip-api (登録住所ベース)。
   // RTT の揺れによる「違反1件」(コスト≈1) と同程度の差を付け、ホスト名の明示的な
   // 地名が DB の当て推量に負けないようにする
-  const rankCost = (c: GeoCandidate) => (c.source === "hostname" ? 0 : c.source === "ipmap" ? 0.5 : 1.0);
+  const rankCost = (c: GeoCandidate) =>
+    c.source === "static" || c.source === "hostname" ? 0 : c.source === "ipmap" ? 0.5 : 1.0;
   const originCost = (h: Hop, c: Pos) => {
     if (originOk(h, c)) return 0;
     const allowed = (h.rtt ?? 0) * KM_PER_MS * 1_000 * 1.15 + 50_000;
@@ -384,7 +394,8 @@ function resolveGeo(t: Trace): void {
     const nextBad = nextJ !== null && violates(nextJ);
     const neighborBad =
       prevJ !== null && nextJ !== null ? prevBad && nextBad : prevBad || nextBad;
-    picks[i] = { pick, ok: originOk(hops[i], pick) && !neighborBad };
+    // 固定位置は正解として扱い、RTT との矛盾で地図から外さない
+    picks[i] = { pick, ok: pick.source === "static" || (originOk(hops[i], pick) && !neighborBad) };
   });
 
   for (let i = 0; i < hops.length; i++) {
@@ -1090,7 +1101,7 @@ function addLiveTrace(host: string, family: 4 | 6, proto: "icmp" | "udp") {
     useOrigin: true,
   };
   traces.set(t.id, t);
-  t.handle = startTrace({ host, v6: family === 6, proto }, (ev) => {
+  t.handle = startTrace({ host, v6: family === 6, proto, wait: urlWait }, (ev) => {
     if (traces.get(t.id) !== t) return; // クリア済みトレースの残イベント
     switch (ev.type) {
       case "cmd":
@@ -1201,7 +1212,9 @@ liveForm.addEventListener("submit", (e) => {
   clearTraces();
   const famSel = segValue("seg-family");
   const proto = segValue("seg-proto") as "icmp" | "udp";
-  const fams: (4 | 6)[] = famSel === "46" ? [6, 4] : famSel === "6" ? [6] : [4];
+  // IP アドレスを直接入れたときは、その種類でだけ打つ (v4 アドレスを traceroute6 に渡しても失敗するだけ)
+  const literal: 4 | 6 | 0 = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ? 4 : host.includes(":") ? 6 : 0;
+  const fams: (4 | 6)[] = literal ? [literal] : famSel === "46" ? [6, 4] : famSel === "6" ? [6] : [4];
   for (const fam of fams) addLiveTrace(host, fam, proto);
   renderAll();
 });

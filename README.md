@@ -76,6 +76,30 @@ Open the URL Vite prints (e.g. http://localhost:5173).
   [docs/demo-v6.txt](docs/demo-v6.txt) or [docs/demo-v4.txt](docs/demo-v4.txt)
   (sanitized real-world traces to ftp.funet.fi)
 
+### Labs and demo networks (fixed locations)
+
+Private addresses and home-built lab networks can't be geolocated, so they normally stay off the map.
+Put a location per address in a JSON file and pass it via `TRACEROUTE_GLOBE_GEO`; those hops are drawn at the
+given place with the given hostname (and are treated as ground truth, never dropped by the RTT sanity check).
+An optional `self` entry replaces the origin as well.
+
+```json
+{
+  "self": { "lat": 35.68, "lon": 139.77, "city": "Tokyo", "countryCode": "JP" },
+  "hosts": {
+    "10.0.12.2": { "lat": 1.35, "lon": 103.82, "city": "Singapore", "country": "Singapore",
+                   "countryCode": "SG", "hostname": "r2.lab" }
+  }
+}
+```
+
+```sh
+TRACEROUTE_GLOBE_GEO=./lab-geo.json npm run dev
+```
+
+Open the page with `?host=10.0.12.2&wait=5` to prefill the target. `wait` is the per-hop timeout in seconds
+(default 2, max 5); raise it for paths whose round trip exceeds about a second, or the last hops show up as `*`.
+
 ## Reading the picture
 
 | Element | Meaning |
