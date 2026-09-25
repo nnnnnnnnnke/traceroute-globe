@@ -732,3 +732,10 @@ a.as-block:hover {
   color: #8fd6cd;
   opacity: 0.85;
 }
+
+/* ?ui=min: 地球儀だけを見せる (投影ページに埋め込むとき) */
+body.ui-min #control,
+body.ui-min #hops,
+body.ui-min #asmap {
+  display: none !important;
+}

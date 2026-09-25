@@ -97,8 +97,25 @@ An optional `self` entry replaces the origin as well.
 TRACEROUTE_GLOBE_GEO=./lab-geo.json npm run dev
 ```
 
-Open the page with `?host=10.0.12.2&wait=5` to prefill the target. `wait` is the per-hop timeout in seconds
-(default 2, max 5); raise it for paths whose round trip exceeds about a second, or the last hops show up as `*`.
+Legs between fixed locations are drawn as glowing arcs instead of following submarine cables or roads, and a
+packet of light travels along them leg by leg, at a speed proportional to each leg's one-way time (half the RTT
+increase).
+
+URL parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `host` | Prefill the target |
+| `wait` | Per-hop timeout in seconds (default 2, max 5). Raise it for paths whose round trip exceeds about a second, or the last hops show up as `*` |
+| `cables=0` / `fiber=0` | Start with the submarine-cable / terrestrial-fibre layer hidden |
+| `ui=min` | Show the globe only (for embedding in another page) |
+| `run=1` | Start tracing as soon as the globe is ready |
+
+An embedding page can re-run the trace with `postMessage({ type: "traceroute-globe:run" })`.
+
+The follow camera visits the hops in order from the origin (it no longer skips hops that arrive in a burst). For a
+route that circles the globe, it then keeps slowly spinning the globe in the packets' direction so the whole loop
+stays in view; dragging the globe stops it.
 
 ## Reading the picture
 

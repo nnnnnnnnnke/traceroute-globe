@@ -1,5 +1,6 @@
-import ThreeView, { Color, vector3ToGeodetic } from "@navaramap/three";
+import ThreeView, { Color, vector3ToGeodetic, type LatLng } from "@navaramap/three";
 import type {
+  ArclineMeshDesc,
   CylinderMeshDesc,
   GlowGlobeMeshDesc,
   SelectiveBloomEffectDesc,
@@ -38,6 +39,27 @@ export interface ChainNode {
 export interface OriginInfo {
   geo: GeoInfo;
   label: string; // 例: "発信元 (OCN)"
+}
+
+/** 固定位置 (TRACEROUTE_GLOBE_GEO) で置いたノード */
+export function isFixedNode(n: ChainNode): boolean {
+  return n.hops.length > 0 && n.hops.every((h) => h.geo?.source === "static");
+}
+
+/** 両端が固定位置の区間。検証網や VPN の論理的なつながりなので、ケーブルや道路には沿わせず弧で描く */
+export function isFixedLeg(a: ChainNode, b: ChainNode): boolean {
+  const fa = isFixedNode(a);
+  const fb = isFixedNode(b);
+  return (fa || a.isOrigin) && (fb || b.isOrigin) && (fa || fb);
+}
+
+/** 経路が地球を何度回っているか (経度の符号付き変化の合計、度)。西回りは負 */
+export function winding(nodes: ChainNode[]): number {
+  let sum = 0;
+  for (let i = 1; i < nodes.length; i++) {
+    sum += ((((nodes[i].lng - nodes[i - 1].lng + 180) % 360) + 360) % 360) - 180;
+  }
+  return sum;
 }
 
 /** 地球儀に重ねる1本の経路 */
@@ -114,6 +136,13 @@ export function buildChain(
   return nodes;
 }
 
+/** ノードの最小 RTT (ms)。発信元は 0、分からなければ NaN */
+function nodeRtt(n: ChainNode): number {
+  if (n.isOrigin && n.hops.length === 0) return 0;
+  const rtts = n.hops.map((h) => h.rtt).filter((r): r is number => r != null);
+  return rtts.length ? Math.min(...rtts) : n.isOrigin ? 0 : NaN;
+}
+
 /** チェーンの測地距離合計 (m)。判明している地点間のみなので実経路の下限 */
 export function chainDistance(nodes: ChainNode[]): number {
   let sum = 0;
@@ -125,9 +154,10 @@ export function chainDistance(nodes: ChainNode[]): number {
 
 /** ノード間のTTLが連続していなければ「位置不明ホップを跨いだ区間」= 破線 */
 function isGapLeg(from: ChainNode, to: ChainNode): boolean {
-  const a = from.hops[from.hops.length - 1]?.ttl;
+  // 発信元 (ホップを持たない) は TTL 0 扱い。最初のホップが TTL 1 なら間に位置不明のホップは無い
+  const a = from.isOrigin && from.hops.length === 0 ? 0 : from.hops[from.hops.length - 1]?.ttl;
   const b = to.hops[0]?.ttl;
-  if (a == null || b == null) return true; // origin など
+  if (a == null || b == null) return true;
   return b - a > 1;
 }
 
@@ -285,6 +315,36 @@ interface LayerHandle {
   update(u: object): void;
 }
 
+interface DescHandle {
+  update(u: object): void;
+  delete(): void;
+}
+
+// 固定位置の区間は弧で描く。長い区間ほど弧の高さの比率を下げ、地球を回る輪が地表から離れすぎないようにする
+const ARC_HEIGHT = 0.35;
+const ARC_FULL_HEIGHT_UNTIL = 8_000_000; // m。これより長い区間は高さの比率を距離に反比例して下げる
+const arcScaleFor = (len: number) => Math.min(ARC_HEIGHT, (ARC_HEIGHT * ARC_FULL_HEIGHT_UNTIL) / len);
+/** 弧長 / 測地距離。ダッシュはシェーダ側で弧長に沿って刻まれるので、パケットの光の位置合わせに使う。
+ *  円弧近似 (矢高 = 比率 × 距離) で、比率 0.35 のとき約 1.30 (旧実装の実測値と一致) */
+function arcLenFactor(scale: number): number {
+  const r = (0.25 + scale * scale) / (2 * scale);
+  return 2 * r * Math.asin(0.5 / r);
+}
+/** パケットの光は実際の片道時間をこの倍率で引き延ばして流す (遅い経路ほどゆっくり旅をする) */
+const PACKET_SLOWDOWN = 6;
+const PACKET_PAUSE_MS = 900;
+/** 地球を回る経路を見せるときの自転の速さ */
+const ORBIT_DEG_PER_S = 9;
+
+/** パケットの光 1 区間分: 経路 (chain) ごとに、区間を順番に旅する */
+interface PacketLeg {
+  chain: string;
+  start: number; // その経路の周期のうち、この区間を走り始める時刻 (ms)
+  ms: number;
+  arcLen: number;
+  dashSize: number;
+}
+
 const CABLE_COLOR = "#2b5f8a";
 const CABLE_HI_COLOR = "#7ff3e6";
 // 経路の色スロット (シアン/オレンジ/バイオレット/グリーン) と海底ケーブル (青) の
@@ -315,6 +375,19 @@ export class Globe {
   private chipRoot!: HTMLElement;
   private chips = new Map<string, HTMLElement>();
   private chains: ChainLayer[] = [];
+  private arcShapeKey = "";
+  private arcs: DescHandle | null = null;
+  private packet: DescHandle | null = null;
+  private packetLegs: PacketLeg[] = [];
+  private packetCycle = new Map<string, number>();
+  private packetT0 = 0;
+  // 追従 (巡回) と自転
+  private tourChain: string | null = null;
+  private tourNext = 0;
+  private touring = false;
+  private tourDone: (() => void) | null = null;
+  private orbitRaf = 0;
+  private motionToken = 0;
   private onNodeClick: ((node: ChainNode) => void) | null = null;
   private ready = false;
   private pendingChains: ChainLayer[] | null = null;
@@ -336,6 +409,9 @@ export class Globe {
 
     await view.init();
     view.animation = true;
+    view.on("preUpdate", () => this.animatePacket());
+    // カメラを触ったら追従の巡回と自転を止める
+    view.canvas.addEventListener("pointerdown", () => this.stopMotion());
 
     view.setCamera({
       lng: 139.7,
@@ -637,6 +713,9 @@ export class Globe {
       slot: number;
       /** ケーブル線形などで上書きされた線形 (無ければ大円) */
       path?: [number, number][];
+      /** 両端が固定位置 → 弧で描く */
+      fixed: boolean;
+      chain: string;
     }
     const legs: Leg[] = [];
     for (const chain of chains) {
@@ -647,7 +726,7 @@ export class Globe {
         const len = haversine(a.lat, a.lng, b.lat, b.lng);
         if (len < 500) continue;
         const path = chain.legPaths?.get(`${a.key}>${b.key}`);
-        legs.push({ a, b, dashed: isGapLeg(a, b), len, slot, path });
+        legs.push({ a, b, dashed: isGapLeg(a, b), len, slot, path, fixed: isFixedLeg(a, b), chain: chain.id });
       }
     }
     // 線形の中身 (ケーブル A→B、道路→ケーブル) が変わっても再描画されるよう、
@@ -662,6 +741,7 @@ export class Globe {
       const solidBySlot = new Map<number, ReturnType<typeof lineFeature>[]>();
       const gapBySlot = new Map<number, ReturnType<typeof lineFeature>[]>();
       for (const l of legs) {
+        if (l.fixed && l.len >= 2_500) continue; // 弧で描く (ArcLine は 2.5km 未満を描けないので地表に残す)
         if (l.dashed) {
           const list = gapBySlot.get(l.slot) ?? [];
           const parts = l.path
@@ -686,6 +766,8 @@ export class Globe {
         });
       }
     }
+
+    this.setArcs(legs.filter((l) => l.fixed && l.len >= 2_500)); // ArcLine は 2km 未満を描けない
 
     // --- ポイント (スロット別) ---
     const waysBySlot = new Map<number, ReturnType<typeof pointFeature>[]>();
@@ -852,62 +934,244 @@ export class Globe {
   /** 地点クリック時のフライ。詳細マップが出る高度まで寄る */
   async flyToNode(node: ChainNode, distance = 550_000): Promise<void> {
     if (!this.ready) return;
+    this.stopMotion();
     await this.view.flyTo(
       { lng: node.lng, lat: node.lat, distance, heading: 0, pitch: -68, roll: 0 },
       { duration: this.flyDuration(1600) },
     );
   }
 
-  /** 指定チェーンの最新ホップに追従: 直前の区間が見える距離でフライ。
-   *  ホップ到着のたびにカメラが揺れないよう、フライ中+短い休止の間は
-   *  次の追従を発火しない (完了後に届いたホップは次回の追従で追いつく) */
-  private followBusy = false;
+  /** 固定位置の区間の弧と、その上を旅するパケットの光 */
+  private setArcs(
+    legs: { a: ChainNode; b: ChainNode; dashed: boolean; len: number; slot: number; chain: string }[],
+  ): void {
+    const key = legs.map((l) => `${l.chain}:${l.slot}:${l.a.key}>${l.b.key}:${l.dashed ? "d" : "s"}`).join("|");
+    // ホップの RTT が後から届くと旅の時間が変わるので、それも署名に入れる
+    const rttKey = legs.map((l) => `${nodeRtt(l.a)}/${nodeRtt(l.b)}`).join(",");
+    if (key + rttKey === this.arcShapeKey) return;
+    this.arcShapeKey = key + rttKey;
+    this.arcs?.delete();
+    this.arcs = null;
+    this.packet?.delete();
+    this.packet = null;
+    this.packetLegs = [];
+    this.packetCycle.clear();
+    if (legs.length === 0) return;
+    const segmentsFor = (len: number) => Math.min(512, Math.max(48, Math.round(len / 25_000)));
+    const geometry = (l: (typeof legs)[number]) =>
+      [
+        { lng: l.a.lng, lat: l.a.lat },
+        { lng: l.b.lng, lat: l.b.lat },
+      ] satisfies LatLng[];
+    this.arcs = this.view.addMesh<ArclineMeshDesc>({
+      effectIds: [this.bloomId],
+      emissiveIntensity: 0.55,
+      arcLines: legs.map((l) => ({
+        geometry: geometry(l),
+        srcColor: new Color().setStyle(TRACE_COLORS[l.slot].arcSrc),
+        tgtColor: new Color().setStyle(TRACE_COLORS[l.slot].arcTgt),
+        thickness: l.dashed ? 1.4 : 2.4,
+        segments: segmentsFor(l.len),
+        arcHeightScale: arcScaleFor(l.len),
+        gradation: 0.35,
+        transparent: true,
+        opacity: 0.95,
+        dashed: l.dashed,
+        dashSize: Math.min(Math.max(l.len / 14, 2_500), 120_000),
+        gapSize: Math.min(Math.max(l.len / 28, 1_250), 60_000),
+        dashOffset: 0,
+      })),
+    }) as unknown as DescHandle;
 
-  followLatest(chainId: string): void {
-    if (!this.ready || this.followBusy) return;
-    const nodes = this.chains.find((c) => c.id === chainId)?.nodes ?? [];
-    const n = nodes.length;
-    if (n === 0) return;
-    const node = nodes[n - 1];
-    let distance = 1_800_000;
-    if (n >= 2) {
-      const prev = nodes[n - 2];
-      // 下限はグロー殻 (半径1.08倍 ≈ 高度510km) に入り込まない距離にする
-      distance = Math.min(
-        Math.max(haversine(prev.lat, prev.lng, node.lat, node.lng) * 1.9, 1_400_000),
-        11_000_000,
-      );
+    // パケットの光: 経路ごとに 1 つ、区間を順番に旅する。区間の所要時間は片道時間 (RTT 差の半分) 比例
+    const solid = legs.filter((l) => !l.dashed);
+    if (solid.length === 0) return;
+    const elapsed = new Map<string, number>();
+    for (const l of solid) {
+      const arcLen = l.len * arcLenFactor(arcScaleFor(l.len));
+      const dRtt = nodeRtt(l.b) - nodeRtt(l.a);
+      const oneWay = Number.isFinite(dRtt) && dRtt > 0 ? dRtt / 2 : l.len / 200_000; // 光ファイバ 200km/ms
+      const ms = Math.min(Math.max(oneWay * PACKET_SLOWDOWN, 280), 6_000);
+      const start = elapsed.get(l.chain) ?? 0;
+      elapsed.set(l.chain, start + ms);
+      const dashSize = Math.min(Math.max(arcLen * 0.07, 40_000), arcLen * 0.5);
+      this.packetLegs.push({ chain: l.chain, start, ms, arcLen, dashSize });
     }
-    this.followBusy = true;
+    for (const [chain, total] of elapsed) this.packetCycle.set(chain, total + PACKET_PAUSE_MS);
+    this.packetT0 = performance.now();
+    this.packet = this.view.addMesh<ArclineMeshDesc>({
+      effectIds: [this.bloomId],
+      emissiveColor: new Color().setStyle("#ffffff"),
+      emissiveIntensity: 0.95,
+      arcLines: solid.map((l, i) => {
+        const p = this.packetLegs[i];
+        return {
+          geometry: geometry(l),
+          srcColor: new Color().setStyle("#ffffff"),
+          tgtColor: new Color().setStyle(TRACE_COLORS[l.slot].arcSrc),
+          thickness: 3.6,
+          segments: segmentsFor(l.len),
+          arcHeightScale: arcScaleFor(l.len),
+          transparent: true,
+          opacity: 0,
+          dashed: true,
+          dashSize: p.dashSize,
+          // 周期 = 弧長にして、光が常に 1 つだけ見えるようにする
+          gapSize: p.arcLen - p.dashSize,
+          dashOffset: 0,
+        };
+      }),
+    }) as unknown as DescHandle;
+  }
+
+  private animatePacket(): void {
+    if (!this.packet || this.packetLegs.length === 0) return;
+    const now = performance.now() - this.packetT0;
+    this.packet.update({
+      arcLines: this.packetLegs.map((p) => {
+        const t = now % (this.packetCycle.get(p.chain) ?? 1);
+        const u = (t - p.start) / p.ms;
+        const on = u >= 0 && u < 1;
+        return { dashOffset: on ? -u * (p.arcLen - p.dashSize) : 0, opacity: on ? 1 : 0 };
+      }),
+    });
+  }
+
+  /** 追従: 地図に載ったノードを出発点から順に巡る。ホップがまとめて届いても飛ばさない */
+  followLatest(chainId: string): void {
+    if (!this.ready) return;
+    if (this.tourChain !== chainId) {
+      this.stopMotion();
+      this.tourChain = chainId;
+      this.tourNext = 0;
+    }
+    if (!this.touring) void this.runTour();
+  }
+
+  private async runTour(): Promise<void> {
+    this.touring = true;
+    try {
+      while (this.tourChain !== null) {
+        const nodes = this.chains.find((c) => c.id === this.tourChain)?.nodes ?? [];
+        if (this.tourNext >= nodes.length) break;
+        const i = this.tourNext++;
+        const node = nodes[i];
+        const prev = nodes[i - 1];
+        // 直前の区間が画面に収まる距離。下限はグロー殻 (高度 510km) に入り込まない距離
+        const distance = prev
+          ? Math.min(Math.max(haversine(prev.lat, prev.lng, node.lat, node.lng) * 1.9, 1_400_000), 11_000_000)
+          : 4_000_000;
+        const ok = await this.view.flyTo(
+          { lng: node.lng, lat: node.lat, distance, heading: 0, pitch: -75, roll: 0 },
+          { duration: this.flyDuration(1_300), easing: "cubicInOut" },
+        );
+        if (!ok) {
+          this.tourChain = null; // ほかのカメラ操作で中断された
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    } finally {
+      this.touring = false;
+    }
+    const done = this.tourDone;
+    if (done && this.tourChain !== null) {
+      this.tourDone = null;
+      done();
+    }
+  }
+
+  /** トレース完了: 巡回が済んでから全体を見せる。地球を回る経路は、ゆっくり自転させて全体を見せる */
+  finishFollow(): void {
+    if (!this.ready) return;
+    const finish = () => {
+      const chain = this.chains.find((c) => c.id === this.tourChain) ?? this.chains[0];
+      const w = chain ? winding(chain.nodes) : 0;
+      if (chain && Math.abs(w) >= 300) this.startOrbit(chain.nodes, Math.sign(w));
+      else this.fitAll();
+    };
+    if (this.touring) this.tourDone = finish;
+    else finish();
+  }
+
+  private startOrbit(nodes: ChainNode[], dir: number): void {
+    this.stopMotion();
+    const token = this.motionToken;
+    const lat = Math.max(-25, Math.min(25, nodes.reduce((s, n) => s + n.lat, 0) / nodes.length));
+    let lng = nodes[0].lng;
+    try {
+      lng = this.view.camera.positionGeographic.lng;
+    } catch {
+      /* カメラコア未接続なら出発点から */
+    }
+    const height = 19_000_000;
     void this.view
-      .flyTo(
-        { lng: node.lng, lat: node.lat, distance, heading: 0, pitch: -75, roll: 0 },
-        { duration: this.flyDuration(2_000), easing: "cubicInOut" },
-      )
-      .finally(() => {
-        // フライ完了後も1秒は静止させる
-        setTimeout(() => {
-          this.followBusy = false;
-        }, 1_000);
+      .flyTo({ lng, lat, height, heading: 0, pitch: -90, roll: 0 }, { duration: this.flyDuration(1_800) })
+      .then((ok) => {
+        if (!ok || token !== this.motionToken) return;
+        let last = performance.now();
+        const step = (now: number) => {
+          // パケットと同じ向きにカメラを回す
+          lng = ((((lng + dir * ORBIT_DEG_PER_S * ((now - last) / 1000) + 180) % 360) + 360) % 360) - 180;
+          last = now;
+          this.view.setCamera({ lng, lat, height, heading: 0, pitch: -90, roll: 0 });
+          this.orbitRaf = requestAnimationFrame(step);
+        };
+        this.orbitRaf = requestAnimationFrame(step);
       });
+  }
+
+  /** 追従の巡回と自転を止める (ユーザー操作・新しいトレース・全体表示のとき) */
+  stopMotion(): void {
+    this.motionToken++;
+    const flying = this.touring;
+    this.tourChain = null;
+    this.tourDone = null;
+    if (this.orbitRaf) {
+      cancelAnimationFrame(this.orbitRaf);
+      this.orbitRaf = 0;
+    }
+    // 巡回の flyTo は途中で止まらないので、今の位置と向き (度) でカメラを置き直して中断させる
+    if (flying) {
+      try {
+        const p = this.view.camera.positionGeographic;
+        const o = this.view.camera.orientation;
+        this.view.setCamera({
+          lng: p.lng, lat: p.lat, height: p.height,
+          heading: o.heading ?? 0, pitch: o.pitch ?? -90, roll: o.roll ?? 0,
+        });
+      } catch {
+        /* カメラコア未接続なら何もしない */
+      }
+    }
   }
 
   /** 表示中の全経路が収まるように俯瞰 */
   fitAll(): void {
     if (!this.ready) return;
+    this.stopMotion();
     const nodes = this.chains.flatMap((c) => c.nodes);
     if (nodes.length === 0) return;
     if (nodes.length === 1) {
       void this.flyToNode(nodes[0]);
       return;
     }
-    const ref = nodes[0].lng;
-    const norm = (lng: number) => ref + ((((lng - ref + 540) % 360) + 360) % 360) - 180;
-    const lats = nodes.map((n) => n.lat);
-    const lngs = nodes.map((n) => norm(n.lng));
-    let cLat = lats.reduce((s, v) => s + v, 0) / lats.length;
-    let cLng = lngs.reduce((s, v) => s + v, 0) / lngs.length;
-    cLng = ((((cLng + 540) % 360) + 360) % 360) - 180;
+    // 中心は 3 次元の平均方向 (緯度経度の単純平均は日付変更線や地球の反対側をまたぐと破綻する)
+    const rad = Math.PI / 180;
+    let x = 0;
+    let y = 0;
+    let z = 0;
+    for (const n of nodes) {
+      x += Math.cos(n.lat * rad) * Math.cos(n.lng * rad);
+      y += Math.cos(n.lat * rad) * Math.sin(n.lng * rad);
+      z += Math.sin(n.lat * rad);
+    }
+    let cLat = nodes[0].lat;
+    let cLng = nodes[0].lng;
+    if (Math.hypot(x, y, z) > 1e-6 * nodes.length) {
+      cLat = Math.atan2(z, Math.hypot(x, y)) / rad;
+      cLng = Math.atan2(y, x) / rad;
+    }
     let maxDist = 0;
     for (const n of nodes) {
       maxDist = Math.max(maxDist, haversine(cLat, cLng, n.lat, n.lng));

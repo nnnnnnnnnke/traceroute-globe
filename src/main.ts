@@ -7,6 +7,7 @@ import {
   flagEmoji,
   greatCirclePoints,
   haversine,
+  isFixedLeg,
   type ChainLayer,
   type ChainNode,
   type OriginInfo,
@@ -213,6 +214,9 @@ const PRESETS = [
 const urlParams = new URLSearchParams(location.search);
 if (urlParams.get("host")) hostInput.value = urlParams.get("host")!;
 const urlWait = Number(urlParams.get("wait")) || undefined;
+// ?cables=0 / ?fiber=0 でケーブル・陸上ファイバの層を最初から隠す。?ui=min は地球儀だけ (投影ページに埋め込む用)
+const layerOff = (name: string) => urlParams.get(name) === "0";
+if (urlParams.get("ui") === "min") document.body.classList.add("ui-min");
 
 // ---------------------------------------------------------------------------
 // 描画
@@ -478,6 +482,7 @@ function ownerMatches(c: CableCandidate, tokens: string[]): boolean {
 }
 
 function candidatesFor(a: ChainNode, b: ChainNode): CableCandidate[] {
+  if (isFixedLeg(a, b)) return []; // 固定位置どうしは論理的なつながりなので弧で描く
   const { key, rttDelta } = legKey(a, b);
   let cands = cableInferCache.get(key);
   if (!cands) {
@@ -600,7 +605,7 @@ function legPathsFor(t: Trace): Map<string, [number, number][]> {
       }
     }
     // ケーブル候補がある区間は線形が辿れなくても大円のまま (道路+フェリーの線にしない)
-    if (!path && !hasCable && isTerrestrialLeg(a, b, len)) {
+    if (!path && !hasCable && !isFixedLeg(a, b) && isTerrestrialLeg(a, b, len)) {
       const road = roadPathCache.get(chainKey);
       if (road === undefined) requestRoadPath(a, b, len);
       else if (road && road !== "pending") path = road.coords;
@@ -1031,6 +1036,7 @@ function removeTrace(id: string) {
 }
 
 function clearTraces() {
+  globe.stopMotion();
   for (const t of traces.values()) t.handle?.stop();
   traces.clear();
   uiMessage = null;
@@ -1062,7 +1068,7 @@ function completeAndSave(t: Trace) {
     if (traces.get(t.id) !== t) return;
     renderAll();
     updateGlobe();
-    if (follow && !anyRunning()) globe.fitAll();
+    if (follow && !anyRunning()) globe.finishFollow();
   };
   if (missing.length === 0) {
     finish();
@@ -1299,6 +1305,10 @@ async function boot() {
   const cablesToggle = $<HTMLInputElement>("#cables-toggle");
   const cablesStatus = $("#cables-status");
   cablesToggle.addEventListener("change", () => globe.setCablesVisible(cablesToggle.checked));
+  if (layerOff("cables")) {
+    cablesToggle.checked = false;
+    globe.setCablesVisible(false);
+  }
   globe.setCableClickHandler((id) => {
     void fetchCableDetail(id)
       .then((d) => {
@@ -1314,6 +1324,10 @@ async function boot() {
   const fiberToggle = $<HTMLInputElement>("#fiber-toggle");
   const fiberStatus = $("#fiber-status");
   fiberToggle.addEventListener("change", () => globe.setFiberVisible(fiberToggle.checked));
+  if (layerOff("fiber")) {
+    fiberToggle.checked = false;
+    globe.setFiberVisible(false);
+  }
   void fetch("/api/fiber")
     .then(async (r) => {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -1363,7 +1377,20 @@ async function boot() {
   } catch {
     /* オフラインでも動くように */
   }
+  // ?run=1 なら初期化が済んだらそのまま打つ (投影ページに埋め込んだとき用)
+  if (urlParams.get("run") === "1" && hostInput.value) liveForm.requestSubmit();
 }
+
+// 埋め込み元 (投影ページ) から postMessage({ type: "traceroute-globe:run" }) で打ち直せる。
+// 経路を切り替えた直後に呼ばれる想定なので、追従も入れ直す
+window.addEventListener("message", (e) => {
+  if (window.parent === window || e.source !== window.parent) return;
+  if ((e.data as { type?: string } | null)?.type !== "traceroute-globe:run") return;
+  if (runButton.disabled || !hostInput.value) return; // 初期化中
+  follow = true;
+  if (anyRunning()) stopAllRunning();
+  liveForm.requestSubmit();
+});
 
 function createChipRoot(): HTMLElement {
   const root = document.createElement("div");
