@@ -330,8 +330,13 @@ function arcLenFactor(scale: number): number {
   const r = (0.25 + scale * scale) / (2 * scale);
   return 2 * r * Math.asin(0.5 / r);
 }
-/** パケットの光は実際の片道時間をこの倍率で引き延ばして流す (遅い経路ほどゆっくり旅をする) */
-const PACKET_SLOWDOWN = 6;
+/** パケットの光は実際の片道時間をこの倍率で引き延ばして流す (遅い経路ほどゆっくり旅をする)。
+ *  ?slow= で変えられる (1〜60。投影ページで旅をゆっくり見せるときなど)。
+ *  ただし 1 区間は最短 0.28 秒 (短すぎて見えないのを防ぐ)・最長 6 秒 (待たせすぎない) に丸める */
+const PACKET_SLOWDOWN = (() => {
+  const v = Number(new URLSearchParams(location.search).get("slow"));
+  return Number.isFinite(v) && v >= 1 ? Math.min(v, 60) : 6;
+})();
 const PACKET_PAUSE_MS = 900;
 /** 地球を回る経路を見せるときの自転の速さ */
 const ORBIT_DEG_PER_S = 9;

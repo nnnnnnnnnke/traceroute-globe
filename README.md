@@ -110,6 +110,7 @@ URL parameters:
 | `cables=0` / `fiber=0` | Start with the submarine-cable / terrestrial-fibre layer hidden |
 | `ui=min` | Show the globe only (for embedding in another page) |
 | `run=1` | Start tracing as soon as the globe is ready |
+| `slow` | How many times slower than the real one-way time the packet of light travels (default 6, up to 60). Each leg still takes at least 0.28 s and at most 6 s |
 
 An embedding page can re-run the trace with `postMessage({ type: "traceroute-globe:run" })`.
 
